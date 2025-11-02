@@ -21,28 +21,21 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Representa a empresa compradora na negociação bilateral.
- * Este agente é criado pelo CoordinatorAgent para negociar com um SellerAgent específico.
- * Ele implementa uma Máquina de Estados Finitos (FSM) para gerenciar o protocolo de
- * oferta alternada (alternating-offer protocol).
- * <p>
- * TODO (Simplificação de Arquitetura):
- * Esta implementação negocia apenas UM ÚNICO LANCE (Bid) com o vendedor.
- * O artigo exige que o BA negocie uma PROPOSTA (Proposal) contendo MÚLTIPLOS LANCES
- * simultaneamente. A lógica nos estados (ex: EvaluateProposal)
- * deve ser refatorada para iterar sobre uma lista de lances "bid-by-bid",
- * em vez de apenas processar `getBids().get(0)`.
+ * BuyerAgent atualizado para:
+ * - aceitar/avaliar múltiplos bids por Proposal (bid-by-bid)
+ * - gerar contrapropostas para cada bid não-aceito
+ * - aceitar o melhor bid quando aplicável e informar o Coordinator ao final
  */
 public class BuyerAgent extends Agent {
     private static final Logger logger = LoggerFactory.getLogger(BuyerAgent.class);
 
     private static final String PROTOCOL_REPORT_RESULT = "report-negotiation-result";
-    // Nomes dos estados
     private static final String STATE_SEND_REQUEST = "SendRequest";
     private static final String STATE_WAIT_FOR_PROPOSAL = "WaitForProposal";
     private static final String STATE_EVALUATE_PROPOSAL = "EvaluateProposal";
@@ -50,26 +43,29 @@ public class BuyerAgent extends Agent {
     private static final String STATE_MAKE_COUNTER_OFFER = "MakeCounterOffer";
     private static final String STATE_END_NEGOTIATION = "EndNegotiation";
 
-    // Variáveis de estado da negociação
     private AID sellerAgent;
     private AID coordinatorAgent;
     private ACLMessage receivedProposalMsg;
-    private Bid finalAcceptedBid = null; // TODO: Deve ser uma List<Bid> ou List<NegotiationResult>
+    private Bid finalAcceptedBid = null;
     private double finalUtility = 0.0;
     private int currentRound = 0;
     private String negotiationId;
     private String lastMessageReplyWith;
-    // Serviços e Configurações
+
     private EvaluationService evalService;
     private ConcessionService concessionService;
     private Map<String, Double> weights;
-    private Map<String, IssueParameters> issueParams; // TODO: Deve ser um Map<String, Map<String, IssueParameters>> (Bundle -> Issue -> Params)
+    private Map<String, IssueParameters> issueParams;
     private double acceptanceThreshold;
     private double buyerRiskBeta;
     private double buyerGamma;
     private int maxRounds;
     private double discountRate;
-    private Bid lastSentCounterBid = null;
+
+    // NEW: store counter bids generated in EvaluateProposal to be sent in MakeCounterOffer
+    private List<Bid> pendingCounterBids = new ArrayList<>();
+    // NEW: store last sent counter bids so we can handle ACCEPT_PROPOSAL when seller accepts them
+    private List<Bid> lastSentCounterBids = new ArrayList<>();
 
     protected void setup() {
         logger.info("Buyer Agent {} is ready.", getAID().getName());
@@ -96,7 +92,6 @@ public class BuyerAgent extends Agent {
             }
         };
 
-        // REGISTRA ESTADOS
         fsm.registerFirstState(new SendRequest(), STATE_SEND_REQUEST);
         fsm.registerState(new WaitForProposal(this), STATE_WAIT_FOR_PROPOSAL);
         fsm.registerState(new EvaluateProposal(), STATE_EVALUATE_PROPOSAL);
@@ -104,14 +99,13 @@ public class BuyerAgent extends Agent {
         fsm.registerState(new MakeCounterOffer(), STATE_MAKE_COUNTER_OFFER);
         fsm.registerLastState(new EndNegotiation(), STATE_END_NEGOTIATION);
 
-        // REGISTRA TRANSIÇÕES
         fsm.registerDefaultTransition(STATE_SEND_REQUEST, STATE_WAIT_FOR_PROPOSAL);
-        fsm.registerTransition(STATE_WAIT_FOR_PROPOSAL, STATE_EVALUATE_PROPOSAL, 1); // 1 = Proposta recebida
-        fsm.registerTransition(STATE_WAIT_FOR_PROPOSAL, STATE_END_NEGOTIATION, 0);  // 0 = Timeout ou erro
-        fsm.registerTransition(STATE_WAIT_FOR_PROPOSAL, STATE_END_NEGOTIATION, 2);  // 2 = Vendedor aceitou
-        fsm.registerTransition(STATE_EVALUATE_PROPOSAL, STATE_ACCEPT_OFFER, 1);      // Utilidade aceitável
-        fsm.registerTransition(STATE_EVALUATE_PROPOSAL, STATE_MAKE_COUNTER_OFFER, 0);// Utilidade baixa, fazer contraproposta
-        fsm.registerTransition(STATE_EVALUATE_PROPOSAL, STATE_END_NEGOTIATION, 2);   // Deadline atingido ou falha
+        fsm.registerTransition(STATE_WAIT_FOR_PROPOSAL, STATE_EVALUATE_PROPOSAL, 1); // Propose
+        fsm.registerTransition(STATE_WAIT_FOR_PROPOSAL, STATE_END_NEGOTIATION, 0);  // Timeout
+        fsm.registerTransition(STATE_WAIT_FOR_PROPOSAL, STATE_END_NEGOTIATION, 2);  // Accept from seller (accepted our last counter)
+        fsm.registerTransition(STATE_EVALUATE_PROPOSAL, STATE_ACCEPT_OFFER, 1);      // accepted (pick best)
+        fsm.registerTransition(STATE_EVALUATE_PROPOSAL, STATE_MAKE_COUNTER_OFFER, 0);// send counters
+        fsm.registerTransition(STATE_EVALUATE_PROPOSAL, STATE_END_NEGOTIATION, 2);   // fail/deadline
         fsm.registerDefaultTransition(STATE_ACCEPT_OFFER, STATE_END_NEGOTIATION);
         fsm.registerDefaultTransition(STATE_MAKE_COUNTER_OFFER, STATE_WAIT_FOR_PROPOSAL);
 
@@ -136,11 +130,6 @@ public class BuyerAgent extends Agent {
         weights.put("service", config.getDouble("weights.service"));
 
         issueParams = new HashMap<>();
-        // TODO (SINERGIA): Esta é a principal falha de sinergia.
-        // O código carrega UM conjunto de parâmetros (min/max) para 'price' e 'delivery'.
-        // O artigo exige que o agente tenha DIFERENTES [min, max] para CADA PACOTE DE PRODUTO
-        // (ex: 'params.1000.price', 'params.1100.price').
-        // Esta estrutura de dados 'issueParams' é inadequada para modelar sinergia.
         loadIssueParams(config, "price", IssueType.COST);
         loadIssueParams(config, "delivery", IssueType.COST);
         issueParams.put("quality", new IssueParameters(0, 1, IssueType.QUALITATIVE));
@@ -164,12 +153,8 @@ public class BuyerAgent extends Agent {
         }
     }
 
-    // --- Comportamentos da FSM ---
+    // --- FSM behaviors ---
 
-    /**
-     * Estado 1: Envia o "Call for Proposal" (CFP) para o Vendedor.
-     * Inicia a negociação.
-     */
     private class SendRequest extends OneShotBehaviour {
         @Override
         public void action() {
@@ -186,49 +171,33 @@ public class BuyerAgent extends Agent {
         }
     }
 
-    /**
-     * Estado 2: Aguarda uma resposta (Proposta) do Vendedor.
-     * Implementa um timeout para evitar bloqueio infinito.
-     */
-    /**
-     * Estado 2: Aguarda uma resposta (Proposta OU Aceitação) do Vendedor.
-     * Implementa um timeout para evitar bloqueio infinito.
-     * Esta versão foi CORRIGIDA para lidar com ACCEPT_PROPOSAL.
-     */
     private class WaitForProposal extends Behaviour {
         private boolean responseReceived = false;
         private long startTime;
         private long timeoutMillis = 15000;
-        private int exitValue = 0; // 0=Timeout, 1=Propose (avaliar), 2=Accept (terminar)
+        private int exitValue = 0;
 
-        public WaitForProposal(Agent a) {
-            super(a);
-        }
+        public WaitForProposal(Agent a) { super(a); }
 
         @Override
         public void onStart() {
             responseReceived = false;
             startTime = System.currentTimeMillis();
-            exitValue = 0; // Reseta o valor de saída
-            // logger.debug("{} [R{}]: Waiting for response from {}", myAgent.getLocalName(), currentRound, sellerAgent.getLocalName());
+            exitValue = 0;
         }
 
         @Override
         public void action() {
-
             MessageTemplate idTemplate = MessageTemplate.and(
                     MessageTemplate.MatchConversationId(negotiationId),
                     MessageTemplate.MatchInReplyTo(lastMessageReplyWith)
             );
 
-            // Template para Proposta
-            MessageTemplate proposeTemplate = MessageTemplate.MatchPerformative(ACLMessage.PROPOSE);
-            // Template para Aceitação
-            MessageTemplate acceptTemplate = MessageTemplate.MatchPerformative(ACLMessage.ACCEPT_PROPOSAL);
-            // Combina ambos com OR
-            MessageTemplate performativeTemplate = MessageTemplate.or(proposeTemplate, acceptTemplate);
+            MessageTemplate performativeTemplate = MessageTemplate.or(
+                    MessageTemplate.MatchPerformative(ACLMessage.PROPOSE),
+                    MessageTemplate.MatchPerformative(ACLMessage.ACCEPT_PROPOSAL)
+            );
 
-            // Combina com o Remetente (Seller)
             MessageTemplate mt = MessageTemplate.and(
                     MessageTemplate.MatchSender(sellerAgent),
                     MessageTemplate.and(performativeTemplate, idTemplate)
@@ -238,51 +207,62 @@ public class BuyerAgent extends Agent {
 
             if (msg != null) {
                 responseReceived = true;
-                receivedProposalMsg = msg; // Armazena a mensagem (seja ela qual for)
+                receivedProposalMsg = msg;
 
                 if (msg.getPerformative() == ACLMessage.PROPOSE) {
-                    // logger.debug("{} [R{}]: Received proposal.", myAgent.getLocalName(), currentRound);
-                    exitValue = 1; // Proposta recebida, ir para EvaluateProposal
-                } else { // Deve ser ACCEPT_PROPOSAL
-                    logger.info("{}: Seller ACCEPTED my last counter-offer.", myAgent.getLocalName());
-                    if (lastSentCounterBid != null) {
-                        finalAcceptedBid = lastSentCounterBid;
-                        finalUtility = evalService.calculateUtility("buyer", finalAcceptedBid, weights, issueParams, buyerRiskBeta);
-                    } else {
-                        logger.warn("{}: Seller accepted, but lastSentCounterBid is null!", myAgent.getLocalName());
+                    exitValue = 1;
+                } else { // ACCEPT_PROPOSAL
+                    logger.info("{}: Seller ACCEPTED our last counter-offer.", myAgent.getLocalName());
+                    // Attempt to read accepted content (if provided)
+                    try {
+                        Object content = msg.getContentObject();
+                        if (content instanceof Proposal) {
+                            Proposal acceptedProposal = (Proposal) content;
+                            // choose best bid among lastSentCounterBids or acceptedProposal
+                            finalAcceptedBid = pickBestBidFromList(acceptedProposal.getBids());
+                            if (finalAcceptedBid != null) {
+                                finalUtility = evalService.calculateUtility("buyer", finalAcceptedBid, weights, issueParams, buyerRiskBeta);
+                                logger.info("{}: Seller accepted bid -> {}", myAgent.getLocalName(), finalAcceptedBid);
+                            }
+                        } else {
+                            // fallback: if lastSentCounterBids not empty, pick best from them
+                            finalAcceptedBid = pickBestBidFromList(lastSentCounterBids);
+                            if (finalAcceptedBid != null) {
+                                finalUtility = evalService.calculateUtility("buyer", finalAcceptedBid, weights, issueParams, buyerRiskBeta);
+                                logger.info("{}: Seller accepted last sent counter bid -> {}", myAgent.getLocalName(), finalAcceptedBid);
+                            }
+                        }
+                    } catch (UnreadableException e) {
+                        logger.warn("{}: ACCEPT_PROPOSAL received but unreadable content.", myAgent.getLocalName());
+                        finalAcceptedBid = pickBestBidFromList(lastSentCounterBids);
+                        if (finalAcceptedBid != null) {
+                            finalUtility = evalService.calculateUtility("buyer", finalAcceptedBid, weights, issueParams, buyerRiskBeta);
+                        }
                     }
+
                     exitValue = 2;
                 }
-
             } else {
                 long elapsed = System.currentTimeMillis() - startTime;
                 if (elapsed > timeoutMillis) {
                     logger.warn("{}: Timeout waiting for proposal from {}. Ending negotiation.", myAgent.getLocalName(), sellerAgent.getLocalName());
-                    responseReceived = true; // Marca 'done' para sair
-                    exitValue = 0; // Sai com timeout
+                    responseReceived = true;
+                    exitValue = 0;
                 } else {
-                    block(500); // Espera um pouco antes de checar de novo
+                    block(500);
                 }
             }
         }
 
         @Override
-        public boolean done() {
-            return responseReceived;
-        }
+        public boolean done() { return responseReceived; }
 
         @Override
-        public int onEnd() {
-            return exitValue; // Retorna 0 (Timeout), 1 (Propose) ou 2 (Accept)
-        }
+        public int onEnd() { return exitValue; }
     }
 
-    /**
-     * Estado 3: Avalia a proposta recebida do Vendedor.
-     * Decide se aceita, rejeita (faz contraproposta) ou encerra por deadline.
-     */
     private class EvaluateProposal extends OneShotBehaviour {
-        private int transitionEvent = 2; // Default: falha/deadline
+        private int transitionEvent = 2; // default: fail/deadline
 
         @Override
         public void action() {
@@ -291,57 +271,67 @@ public class BuyerAgent extends Agent {
 
             if (currentRound > maxRounds) {
                 logger.warn("{}: Deadline reached ({}/{}) . Ending negotiation.", myAgent.getLocalName(), currentRound, maxRounds);
-                finalAcceptedBid = null;
                 transitionEvent = 2;
                 return;
             }
+
+            pendingCounterBids.clear();
 
             try {
                 Serializable content = receivedProposalMsg.getContentObject();
                 if (content instanceof Proposal) {
                     Proposal p = (Proposal) content;
-                    if (p.getBids() != null && !p.getBids().isEmpty()) {
+                    List<Bid> incoming = p.getBids();
+                    if (incoming == null || incoming.isEmpty()) {
+                        logger.warn("{}: Received empty proposal.", myAgent.getLocalName());
+                        transitionEvent = 2;
+                        return;
+                    }
 
-                        // TODO (Simplificação de Arquitetura): Esta é a falha central.
-                        // O código pega apenas o *primeiro* lance.
-                        // O artigo exige que o agente avalie CADA lance na lista p.getBids()
-                        // "bid-by-bid".
-                        // Isto deveria ser um LOOP (for each bid in p.getBids()).
-                        Bid receivedBid = p.getBids().get(0);
+                    List<Bid> accepted = new ArrayList<>();
+                    List<Bid> counters = new ArrayList<>();
 
-                        // TODO (SINERGIA): O 'issueParams' usado aqui é genérico.
-                        // Para a sinergia, o EvaluationService deveria ser chamado com
-                        // parâmetros [min, max] específicos para o
-                        // 'receivedBid.getProductBundle()'.
+                    // Evaluate each incoming bid individually (bid-by-bid)
+                    for (Bid receivedBid : incoming) {
+                        // TODO: use bundle-specific issueParams if available (sinergia)
                         double utility = evalService.calculateUtility("buyer", receivedBid, weights, issueParams, buyerRiskBeta);
-                        logger.info("{}: Received bid utility = {} (Threshold = {})", myAgent.getLocalName(), String.format("%.4f", utility), String.format("%.4f", acceptanceThreshold));
 
-                        // Implementação da Eq. 7: U(Bid_s) >= U_min E U(Bid_s) >= U(Bid_b(t+1))
+                        // Hypothetical counter for next round (per bid)
                         Bid hypotheticalCounter = concessionService.generateCounterBid(receivedBid, currentRound + 1, maxRounds, buyerGamma, discountRate, issueParams, "buyer");
                         double nextCounterUtility = evalService.calculateUtility("buyer", hypotheticalCounter, weights, issueParams, buyerRiskBeta);
 
+                        logger.info("{}: Bid {} utility = {} (threshold {})", myAgent.getLocalName(), receivedBid.getBundleId(), String.format("%.4f", utility), String.format("%.4f", acceptanceThreshold));
+
                         if (utility >= acceptanceThreshold && utility >= nextCounterUtility) {
-                            logger.info("{}: Offer is acceptable (Utility {} >= Threshold {} AND >= Next Counter {}). Accepting.",
-                                    myAgent.getLocalName(),
-                                    String.format("%.4f", utility),
-                                    String.format("%.4f", acceptanceThreshold),
-                                    String.format("%.4f", nextCounterUtility));
-                            finalAcceptedBid = receivedBid; // TODO: Deveria *adicionar* a uma lista de lances aceitos
-                            finalUtility = utility;
-                            transitionEvent = 1;
+                            accepted.add(receivedBid);
                         } else {
-                            logger.info("{}: Offer not acceptable (Utility {}). Will make counter-offer.", myAgent.getLocalName(), String.format("%.4f", utility));
-                            transitionEvent = 0;
-                            // TODO: Deveria *adicionar* a uma lista de lances a serem contra-ofertados
+                            counters.add(hypotheticalCounter);
                         }
-                    } else {
-                        logger.warn("{}: Received empty proposal.", myAgent.getLocalName());
                     }
+
+                    // Decide transition: if at least one accepted and no counters -> accept; else propose counters
+                    if (!accepted.isEmpty() && counters.isEmpty()) {
+                        // choose best accepted (highest utility)
+                        finalAcceptedBid = pickBestBidFromList(accepted);
+                        finalUtility = evalService.calculateUtility("buyer", finalAcceptedBid, weights, issueParams, buyerRiskBeta);
+                        transitionEvent = 1; // AcceptOffer
+                        logger.info("{}: Will accept bid {} (best among accepted)", myAgent.getLocalName(), finalAcceptedBid.getBundleId());
+                    } else if (!counters.isEmpty()) {
+                        pendingCounterBids.addAll(counters);
+                        transitionEvent = 0; // MakeCounterOffer
+                        logger.info("{}: Will send {} counter bids.", myAgent.getLocalName(), pendingCounterBids.size());
+                    } else {
+                        // no accepted and no counters (edge) -> end
+                        transitionEvent = 2;
+                    }
+
                 } else {
                     logger.error("{}: Received unexpected content type: {}", myAgent.getLocalName(), (content == null ? "null" : content.getClass().getName()));
+                    transitionEvent = 2;
                 }
             } catch (UnreadableException e) {
                 logger.error("{}: Failed to read proposal content.", myAgent.getLocalName(), e);
+                transitionEvent = 2;
             }
         }
 
@@ -351,74 +341,59 @@ public class BuyerAgent extends Agent {
         }
     }
 
-    /**
-     * Estado 4: Gera e envia uma contraproposta ao Vendedor.
-     */
     private class MakeCounterOffer extends OneShotBehaviour {
         @Override
         public void action() {
-            logger.info("{} [R{}]: Generating counter-offer...", myAgent.getLocalName(), currentRound);
+            logger.info("{} [R{}]: Generating counter-offers (count={})", myAgent.getLocalName(), currentRound, pendingCounterBids.size());
+            if (pendingCounterBids.isEmpty()) {
+                logger.warn("{}: No pending counters to send.", myAgent.getLocalName());
+                return;
+            }
+            Proposal counterProposal = new Proposal(pendingCounterBids);
+            lastSentCounterBids.clear();
+            lastSentCounterBids.addAll(pendingCounterBids);
 
+            ACLMessage proposeMsg = new ACLMessage(ACLMessage.PROPOSE);
+            proposeMsg.addReceiver(sellerAgent);
+            proposeMsg.setConversationId(negotiationId);
+            proposeMsg.setInReplyTo(receivedProposalMsg.getReplyWith());
+            lastMessageReplyWith = "prop-" + negotiationId + "-" + System.currentTimeMillis();
+            proposeMsg.setReplyWith(lastMessageReplyWith);
             try {
-                Proposal receivedP = (Proposal) receivedProposalMsg.getContentObject();
-                // TODO (Simplificação): Novamente, pega apenas o lance [0].
-                // Isto deveria ser um LOOP que gera contra-lances para CADA
-                // lance que foi rejeitado no estado EvaluateProposal.
-                Bid receivedB = receivedP.getBids().get(0);
-
-                // TODO (SINERGIA): 'issueParams' genérico. Deveria usar params
-                // específicos para o 'receivedB.getProductBundle()'.
-                Bid counterBid = concessionService.generateCounterBid(
-                        receivedB,
-                        currentRound,
-                        maxRounds,
-                        buyerGamma,
-                        discountRate,
-                        issueParams,
-                        "buyer"
-                );
-                lastSentCounterBid = counterBid;
-                // TODO (Simplificação): A contraproposta deveria ser uma *lista*
-                // de todos os contra-lances gerados no loop.
-                Proposal counterProposal = new Proposal(List.of(counterBid));
-                ACLMessage proposeMsg = new ACLMessage(ACLMessage.PROPOSE);
-                proposeMsg.addReceiver(sellerAgent);
-                proposeMsg.setConversationId(negotiationId);
-                proposeMsg.setInReplyTo(receivedProposalMsg.getReplyWith());
-                lastMessageReplyWith = "prop-" + negotiationId + "-" + System.currentTimeMillis();
-                proposeMsg.setReplyWith(lastMessageReplyWith);
                 proposeMsg.setContentObject(counterProposal);
                 myAgent.send(proposeMsg);
-                logger.info("{}: Sent counter-proposal (Round {}) -> {}", myAgent.getLocalName(), currentRound, counterBid.getIssues().get(0));
-
-            } catch (UnreadableException | IOException e) {
-                logger.error("{}: Error creating/sending counter-proposal", myAgent.getLocalName(), e);
+                logger.info("{}: Sent counter-proposal with {} bid(s).", myAgent.getLocalName(), pendingCounterBids.size());
+            } catch (IOException e) {
+                logger.error("{}: Error sending counter-proposal", myAgent.getLocalName(), e);
             }
+            // after sending counters, clear pendingCounterBids (we keep lastSentCounterBids for possible ACCEPT)
+            pendingCounterBids.clear();
         }
     }
 
-    /**
-     * Estado 5: Envia uma mensagem de aceitação para a proposta do Vendedor.
-     */
     private class AcceptOffer extends OneShotBehaviour {
         @Override
         public void action() {
-            // TODO (Simplificação): O agente está aceitando a *proposta inteira*.
-            // Na implementação correta, ele deveria aceitar *lances específicos*
-            // que foram avaliados positivamente.
+            if (finalAcceptedBid == null) {
+                logger.warn("{}: AcceptOffer state reached but no finalAcceptedBid is set.", myAgent.getLocalName());
+                return;
+            }
             logger.info("{}: Sending acceptance message to {}", myAgent.getLocalName(), sellerAgent.getLocalName());
+            // Build a Proposal containing the accepted bid to inform the seller explicitly
+            Proposal acceptedProposal = new Proposal(List.of(finalAcceptedBid));
             ACLMessage accept = new ACLMessage(ACLMessage.ACCEPT_PROPOSAL);
             accept.addReceiver(sellerAgent);
             accept.setConversationId(negotiationId);
             accept.setInReplyTo(receivedProposalMsg.getReplyWith());
-            accept.setContent("Offer accepted.");
+            try {
+                accept.setContentObject(acceptedProposal);
+            } catch (IOException e) {
+                accept.setContent("Offer accepted.");
+            }
             myAgent.send(accept);
         }
     }
 
-    /**
-     * Estado Final (FSM): Ações de finalização da negociação.
-     */
     private static class EndNegotiation extends OneShotBehaviour {
         @Override
         public void action() {
@@ -426,10 +401,6 @@ public class BuyerAgent extends Agent {
         }
     }
 
-    /**
-     * Comportamento Final: Informa o Coordenador sobre o resultado da negociação.
-     * Envia o lance final (se houver) ou uma mensagem de falha.
-     */
     private class InformCoordinatorDone extends OneShotBehaviour {
         @Override
         public void action() {
@@ -437,10 +408,6 @@ public class BuyerAgent extends Agent {
             doneMsg.addReceiver(coordinatorAgent);
             doneMsg.setProtocol(PROTOCOL_REPORT_RESULT);
             try {
-                // TODO (Simplificação): Envia apenas UM resultado.
-                // Na implementação correta, deveria enviar uma LISTA de
-                // NegotiationResult, contendo todos os lances acordados
-                // com este fornecedor específico.
                 if (finalAcceptedBid != null) {
                     NegotiationResult result = new NegotiationResult(finalAcceptedBid, finalUtility, sellerAgent.getLocalName());
                     doneMsg.setContentObject(result);
@@ -455,4 +422,21 @@ public class BuyerAgent extends Agent {
             }
         }
     }
+
+    // -- utility helpers --
+
+    private Bid pickBestBidFromList(List<Bid> bids) {
+        if (bids == null || bids.isEmpty()) return null;
+        Bid best = null;
+        double bestU = Double.NEGATIVE_INFINITY;
+        for (Bid b : bids) {
+            double u = evalService.calculateUtility("buyer", b, weights, issueParams, buyerRiskBeta);
+            if (u > bestU) {
+                bestU = u;
+                best = b;
+            }
+        }
+        return best;
+    }
 }
+

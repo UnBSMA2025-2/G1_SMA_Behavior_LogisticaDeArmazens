@@ -2,32 +2,34 @@ package mas.logic;
 
 import mas.models.Bid;
 import mas.models.NegotiationIssue;
+import mas.models.ProductBundle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Contém a lógica de negócio para avaliar lances (Bids).
- * Carrega TFNs do ConfigLoader e avalia da perspectiva do 'buyer' ou 'seller'.
- * Implementa as equações de avaliação de utilidade do artigo.
- * <p>
- * TODO (Simplificação de Sinergia):
- * Este serviço implementa corretamente as FÓRMULAS (Eq. 1-4), mas não
- * implementa a LÓGICA DE SINERGIA. O artigo afirma que a sinergia é
- * modelada por "atribuir diferentes [min_k, max_k] para diferentes
- * pacotes de produtos".
- * A implementação atual usa um único conjunto de [min, max] genérico
- * (ex: 'params.price') para todos os lances, ignorando o ProductBundle.
+ * EvaluationService com suporte a parâmetros por ProductBundle (sinergia).
+ *
+ * - Mantém compatibilidade com a API antiga calculateUtility(...).
+ * - Quando um Bid contém um ProductBundle, cria (lazy) parâmetros específicos
+ *   para esse bundle derivando-os a partir dos issueParams globais e dos
+ *   synergyBounds do bundle.
+ * - Permite override/atualização manual via updateBundleIssueParams(...) e clearBundleParams(...).
  */
 public class EvaluationService {
 
     private static final Logger logger = LoggerFactory.getLogger(EvaluationService.class);
 
-    // Mapas para armazenar TFNs carregados (Correto)
     private final Map<String, double[]> tfnMapBuyer;
     private final Map<String, double[]> tfnMapSeller;
+
+    /**
+     * Mapa bundleId -> (issueName -> IssueParameters) criado a partir dos globals.
+     * Thread-safe.
+     */
+    private final Map<String, Map<String, IssueParameters>> bundleIssueParams = new ConcurrentHashMap<>();
 
     public EvaluationService() {
         this.tfnMapBuyer = new HashMap<>();
@@ -37,101 +39,176 @@ public class EvaluationService {
         loadTfnsFromConfig(config, "seller", this.tfnMapSeller);
     }
 
-    /**
-     * Backwards-compatible overload: mantém a assinatura antiga usada por testes/consumidores
-     * que não informam o agentType. Por padrão assume 'buyer'.
-     * @deprecated Preferir a versão com agentType explícito.
-     */
     @Deprecated
     public double calculateUtility(Bid bid, Map<String, Double> weights,
                                    Map<String, IssueParameters> issueParams, double riskBeta) {
         return calculateUtility("buyer", bid, weights, issueParams, riskBeta);
     }
 
-    /**
-     * Calcula a utilidade agregada de um Bid (Eq. 4).
-     *
-     * @param agentType   "buyer" ou "seller".
-     * @param bid         O lance a ser avaliado.
-     * @param weights     Mapa de pesos (ωk) do agente.
-     * @param issueParams Mapa com parâmetros (min, max, tipo) do agente.
-     * @param riskBeta    O fator de risco (β) do agente.
-     * @return A utilidade total (0-1).
-     */
     public double calculateUtility(String agentType, Bid bid, Map<String, Double> weights,
                                    Map<String, IssueParameters> issueParams, double riskBeta) {
         double totalUtility = 0.0;
 
-        if (bid == null || bid.getIssues() == null) { /* ... (tratamento de erro) ... */
+        if (bid == null || bid.getIssues() == null) {
             return 0.0;
         }
-        if (weights == null || issueParams == null) { /* ... (tratamento de erro) ... */
+        if (weights == null || issueParams == null) {
             return 0.0;
         }
 
-        // TODO (SINERGIA): O 'issueParams' recebido aqui é genérico.
-        // A implementação correta exigiria que o AGENTE (Buyer/Seller)
-        // passasse um 'issueParams' específico para o 'bid.getProductBundle()'.
-        // Ou, este método precisaria de uma lógica para buscar os
-        // parâmetros corretos (ex: 'params.1100.price') com base no
-        // 'bid.getProductBundle()'.
-        // A lógica de avaliação atual ignora a sinergia.
+        // Se há um ProductBundle no Bid, tente obter (ou derivar) params específicos
+        ProductBundle bundle = bid.getProductBundle();
+        Map<String, IssueParameters> effectiveParams = issueParams;
+        if (bundle != null && bundle.getId() != null) {
+            Map<String, IssueParameters> specific = bundleIssueParams.get(bundle.getId());
+            if (specific == null) {
+                // Deriva e registra parâmetros para esse bundle (lazy)
+                specific = deriveBundleIssueParams(bundle, issueParams);
+                bundleIssueParams.put(bundle.getId(), specific);
+                logger.debug("EvaluationService: Derived issueParams for bundle {} -> {}", bundle.getId(), specific.keySet());
+            }
+            effectiveParams = specific;
+        }
 
         for (NegotiationIssue issue : bid.getIssues()) {
             if (issue == null || issue.getName() == null) continue;
 
-            String issueName = issue.getName().toLowerCase();
+            String issueName = issue.getName().trim().toLowerCase();
             double weight = weights.getOrDefault(issueName, 0.0);
 
             if (Math.abs(weight) < 1e-9) continue;
 
-            // Pega o parâmetro (min/max) genérico
-            IssueParameters params = issueParams.get(issueName);
+            IssueParameters params = effectiveParams.get(issueName);
             if (params == null) {
+                // fallback: try original case variants
+                params = effectiveParams.get(issue.getName());
+            }
+            if (params == null) {
+                logger.debug("EvaluationService: No IssueParameters for issue '{}' (bundle-aware). Skipping.", issueName);
                 continue;
             }
 
             double normalizedUtility = normalizeIssueUtility(agentType, issue, params, riskBeta);
             totalUtility += weight * normalizedUtility;
         }
+        // Normaliza para [0,1]
         return Math.max(0.0, Math.min(1.0, totalUtility));
     }
 
     /**
-     * Normaliza a utilidade de um único issue (Qualitativo ou Quantitativo).
+     * Deriva parâmetros (min/max/type) para cada issue do bundle a partir dos `baseIssueParams`.
+     * Estratégia:
+     * - Se o bundle.metadata contém "params.<issueName>" (ex: "params.price" -> "10,100"), usa esse value direto.
+     * - Caso contrário, usa synergyBounds do bundle (valores entre 0 e 1) para posicionar
+     *   min/max dentro do intervalo global [globalMin, globalMax]:
+     *
+     *   bundleMin = globalMin + synergyMin * (globalMax - globalMin)
+     *   bundleMax = globalMin + synergyMax * (globalMax - globalMin)
+     *
+     * - Issues qualitativos mantêm os mesmos parâmetros (tipo QUALITATIVE).
      */
+    private Map<String, IssueParameters> deriveBundleIssueParams(ProductBundle bundle,
+                                                                 Map<String, IssueParameters> baseIssueParams) {
+        Map<String, IssueParameters> derived = new HashMap<>();
+        double sMin = bundle.getSynergyMin();
+        double sMax = bundle.getSynergyMax();
+        // clamp 0..1
+        sMin = Math.max(0.0, Math.min(1.0, sMin));
+        sMax = Math.max(0.0, Math.min(1.0, sMax));
+        if (sMin > sMax) {
+            double t = sMin; sMin = sMax; sMax = t;
+        }
+
+        for (Map.Entry<String, IssueParameters> e : baseIssueParams.entrySet()) {
+            String issueName = e.getKey().trim().toLowerCase();
+            IssueParameters gp = e.getValue();
+            if (gp == null) continue;
+
+            if (gp.getType() == IssueType.QUALITATIVE) {
+                derived.put(issueName, gp);
+                continue;
+            }
+
+            // Primeiro, se o bundle contém metadata com explicit params, use
+            Object explicit = null;
+            try {
+                explicit = bundle.getMetadata().get("params." + issueName);
+            } catch (Exception ex) {
+                explicit = null;
+            }
+            if (explicit instanceof String) {
+                String v = ((String) explicit).trim();
+                String[] parts = v.split(",");
+                if (parts.length == 2) {
+                    try {
+                        double min = Double.parseDouble(parts[0].trim());
+                        double max = Double.parseDouble(parts[1].trim());
+                        derived.put(issueName, new IssueParameters(min, max, gp.getType()));
+                        continue;
+                    } catch (NumberFormatException nfe) {
+                        // ignore and fallback to synergy mapping
+                    }
+                }
+            }
+
+            // Fallback: derive within global interval using synergyMin/Max as ratios
+            double globalMin = gp.getMin();
+            double globalMax = gp.getMax();
+            double range = globalMax - globalMin;
+            if (Math.abs(range) < 1e-12) {
+                // degenerate, keep global
+                derived.put(issueName, new IssueParameters(globalMin, globalMax, gp.getType()));
+            } else {
+                double bmin = globalMin + sMin * range;
+                double bmax = globalMin + sMax * range;
+                // ensure order
+                if (bmin > bmax) { double t = bmin; bmin = bmax; bmax = t; }
+                derived.put(issueName, new IssueParameters(bmin, bmax, gp.getType()));
+            }
+        }
+        return derived;
+    }
+
+    /**
+     * Limpas/override públicos para permitir atualizações manuais.
+     */
+    public void updateBundleIssueParams(String bundleId, Map<String, IssueParameters> params) {
+        if (bundleId == null || params == null) return;
+        bundleIssueParams.put(bundleId, new HashMap<>(params));
+    }
+
+    public void clearBundleParams(String bundleId) {
+        if (bundleId == null) return;
+        bundleIssueParams.remove(bundleId);
+    }
+
+    // --- Normalização existente (mantive suas implementações, com pequenas chamadas unificadas) ---
+
     private double normalizeIssueUtility(String agentType, NegotiationIssue issue, IssueParameters params, double riskBeta) {
         Object value = issue.getValue();
-        if (value == null) { /* ... (tratamento de erro) ... */
+        if (value == null) {
             return 0.0;
         }
 
         if (params.getType() == IssueType.QUALITATIVE) {
             if (value instanceof String) {
-                // A normalização qualitativa (Eq. 3) está correta.
                 return normalizeQualitativeUtility(agentType, (String) value);
-            } else { /* ... (tratamento de erro) ... */
+            } else {
                 return 0.0;
             }
         } else {
             if (value instanceof Number) {
-                // A normalização quantitativa usa os 'params' genéricos.
                 return normalizeQuantitativeUtility(((Number) value).doubleValue(), params, riskBeta);
-            } else { /* ... (tratamento de erro) ... */
+            } else {
                 return 0.0;
             }
         }
     }
 
-    /**
-     * Normaliza um issue qualitativo (Eq. 3).
-     * Esta implementação está CORRETA.
-     */
     private double normalizeQualitativeUtility(String agentType, String linguisticValue) {
         Map<String, double[]> tfnMap = agentType.equalsIgnoreCase("seller") ? this.tfnMapSeller : this.tfnMapBuyer;
         String lookupKey = linguisticValue.replace("_", " ").trim().toLowerCase();
         double[] tfn = tfnMap.get(lookupKey);
-        // ... (Fallbacks) ...
         if (tfn == null) {
             tfn = tfnMap.get(lookupKey.replace(" ", "_"));
         }
@@ -142,15 +219,7 @@ public class EvaluationService {
         return (tfn[0] + 4 * tfn[1] + tfn[2]) / 6.0;
     }
 
-    /**
-     * Normaliza um issue quantitativo (Eqs. 1 e 2).
-     * Esta implementação está CORRETA para as fórmulas, mas
-     * usa parâmetros (min/max) genéricos.
-     */
     private double normalizeQuantitativeUtility(double value, IssueParameters params, double riskBeta) {
-        // TODO (SINERGIA): 'params' (min/max) são genéricos.
-        // A lógica de sinergia exige que [min, max] sejam
-        // específicos do ProductBundle que está sendo avaliado.
         double min = params.getMin();
         double max = params.getMax();
         double range = max - min;
@@ -186,11 +255,8 @@ public class EvaluationService {
         }
     }
 
-    // --- Classes Internas (IssueParameters, IssueType) ---
+    // --- Inner classes ---
 
-    /**
-     * Classe auxiliar para armazenar os parâmetros de um issue.
-     */
     public static class IssueParameters {
         private final double min, max;
         private final IssueType type;
@@ -206,32 +272,19 @@ public class EvaluationService {
             this.type = type;
         }
 
-        public double getMin() {
-            return min;
-        }
+        public double getMin() { return min; }
+        public double getMax() { return max; }
+        public IssueType getType() { return type; }
 
-        public double getMax() {
-            return max;
-        }
-
-        public IssueType getType() {
-            return type;
+        @Override
+        public String toString() {
+            return "IssueParameters{" + "min=" + min + ", max=" + max + ", type=" + type + '}';
         }
     }
 
-    /**
-     * Enumeração para os tipos de critério.
-     */
-    public enum IssueType {
-        COST,
-        BENEFIT,
-        QUALITATIVE
-    }
+    public enum IssueType { COST, BENEFIT, QUALITATIVE }
 
-    /**
-     * Método auxiliar para carregar TFNs do config.
-     * Esta implementação está CORRETA.
-     */
+    // --- TFN loader (mantive sua implementação) ---
     private void loadTfnsFromConfig(ConfigLoader config, String prefix, Map<String, double[]> map) {
         String[] terms = {"very_poor", "poor", "medium", "good", "very_good"};
         for (String term : terms) {
@@ -263,3 +316,4 @@ public class EvaluationService {
         }
     }
 }
+
