@@ -10,9 +10,10 @@ import java.util.Objects;
  * Representa um lance (Bid) para um pacote de produtos específico.
  * Estruturado conforme a definição do artigo: ⟨PB, Issues, Quantities⟩.
  *
- * Observações:
- * - Quantities deve ter o mesmo tamanho que bundle.getItems().size() (quantidade por item do bundle).
- * - Esta classe é serializável para ser enviada via msg.setContentObject(...)
+ * Compatibilidades:
+ * - Aceita quantities com tamanho igual ao número de items do bundle (recomendado).
+ * - Aceita quantities com tamanho 4 representando [P1,P2,P3,P4] (legacy) e converte
+ *   automaticamente para o vetor por item do bundle, mapeando SKUs P1..P4.
  */
 public class Bid implements Serializable {
     private static final long serialVersionUID = 1L;
@@ -25,15 +26,45 @@ public class Bid implements Serializable {
     public Bid(ProductBundle productBundle, List<NegotiationIssue> issues, int[] quantities) {
         this.productBundle = Objects.requireNonNull(productBundle, "productBundle");
         this.issues = (issues == null) ? Collections.emptyList() : Collections.unmodifiableList(issues);
-        this.quantities = (quantities == null) ? new int[0] : Arrays.copyOf(quantities, quantities.length);
 
-        // Validação: se quisermos mapear Q por item do bundle, garantir compatibilidade
+        // Defensive: if quantities is null, set zero-length array
+        int[] q = (quantities == null) ? new int[0] : Arrays.copyOf(quantities, quantities.length);
+
         int expected = productBundle.getItems().size();
-        if (this.quantities.length != expected) {
+
+        if (q.length == expected) {
+            // OK: already per-item quantities
+            this.quantities = Arrays.copyOf(q, q.length);
+        } else if (q.length == 4) {
+            // Legacy format: vector P1..P4 -> need to map into per-item vector
+            this.quantities = mapLegacyVectorToBundleItems(productBundle, q);
+        } else {
             throw new IllegalArgumentException(String.format(
-                    "Invalid quantities length: expected %d (bundle items), got %d",
-                    expected, this.quantities.length));
+                    "Invalid quantities length: expected %d (bundle items) or 4 (legacy P1..P4), got %d",
+                    expected, q.length));
         }
+    }
+
+    private int[] mapLegacyVectorToBundleItems(ProductBundle bundle, int[] legacy) {
+        // legacy: legacy[0]=P1, [1]=P2, [2]=P3, [3]=P4
+        int n = bundle.getItems().size();
+        int[] out = new int[n];
+        List<ProductBundle.Item> items = bundle.getItems();
+        for (int i = 0; i < n; i++) {
+            ProductBundle.Item it = items.get(i);
+            String sku = (it.getSku() == null) ? "" : it.getSku().trim().toUpperCase();
+            int qty = 0;
+            if ("P1".equals(sku) || sku.contains("P1")) qty = legacy[0];
+            else if ("P2".equals(sku) || sku.contains("P2")) qty = legacy[1];
+            else if ("P3".equals(sku) || sku.contains("P3")) qty = legacy[2];
+            else if ("P4".equals(sku) || sku.contains("P4")) qty = legacy[3];
+            else {
+                // If SKU doesn't map to P1..P4, leave 0 (legacy vector has no info for custom SKUs)
+                qty = 0;
+            }
+            out[i] = Math.max(0, qty);
+        }
+        return out;
     }
 
     public ProductBundle getProductBundle() {
