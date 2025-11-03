@@ -4,7 +4,6 @@ import jade.core.AID;
 import jade.core.Agent;
 import jade.core.behaviours.CyclicBehaviour;
 import jade.core.behaviours.OneShotBehaviour;
-import jade.core.behaviours.SequentialBehaviour;
 import jade.core.behaviours.TickerBehaviour;
 import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
@@ -17,15 +16,11 @@ import mas.models.ProductBundle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.io.*;
+import java.util.*;
 
 /**
- * Agente central que orquestra o processo de seleção de fornecedores.
- * Implementa a arquitetura do CA da Figura 1.
- * 1. (Preparação) Obtém a tarefa do TDA e os pacotes (bundles) do SDA .
- * 2. (Barganha) Cria BAs para negociar com SAs.
- * 3. (Determinação) Coleta resultados e usa o WDS para selecionar vencedores.
+ * CoordinatorAgent ajustado: espera define-task-protocol para iniciar pipeline.
  */
 public class CoordinatorAgent extends Agent {
     private static final Logger logger = LoggerFactory.getLogger(CoordinatorAgent.class);
@@ -33,34 +28,27 @@ public class CoordinatorAgent extends Agent {
     private static final String PROTOCOL_GET_BUNDLES = "get-bundles-protocol";
     private static final String PROTOCOL_REPORT_RESULT = "report-negotiation-result";
     private static final String PROTOCOL_DEFINE_TASK = "define-task-protocol";
+
     private List<AID> sellerAgents;
     private int finishedCounter = 0;
     private WinnerDeterminationService wds;
     private List<NegotiationResult> negotiationResults;
     private int[] productDemand;
-    private List<ProductBundle> preferredBundles; // Armazena os pacotes preferidos
+    private List<ProductBundle> preferredBundles;
 
+    @Override
     protected void setup() {
         logger.info("Coordinator Agent {} is ready.", getAID().getName());
 
         this.wds = new WinnerDeterminationService();
         this.negotiationResults = new ArrayList<>();
-        this.preferredBundles = new ArrayList<>(); // Inicializa a lista
+        this.preferredBundles = new ArrayList<>();
 
-        SequentialBehaviour preparationPhase = new SequentialBehaviour();
-        preparationPhase.addSubBehaviour(new WaitForTask());
-        preparationPhase.addSubBehaviour(new RequestProductBundles());
-        preparationPhase.addSubBehaviour(new StartNegotiations());
-
-        addBehaviour(preparationPhase);
+        addBehaviour(new WaitForTask());
     }
 
-    // --- Comportamentos da Fase de Preparação ---
-
-    /**
-     * Estado 1: Aguarda a definição da tarefa (produtos requeridos) do TDA.
-     */
     private class WaitForTask extends CyclicBehaviour {
+        @Override
         public void action() {
             MessageTemplate mt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
@@ -68,42 +56,78 @@ public class CoordinatorAgent extends Agent {
             );
             ACLMessage msg = myAgent.receive(mt);
 
-            if (msg != null) {
-                String productList = msg.getContent();
-                System.out.println("🎯 ===== CA RECEIVED DYNAMIC DEMAND: " + productList + " =====");
-                logger.info("🎯 CA RECEIVED DYNAMIC DEMAND: {}", productList);
-                logger.info("CA: Received NEW dynamic task. Products required: {}", productList);
-                
-                String[] products = productList.split(",");
-                productDemand = new int[4];
-                
-                for (String product : products) {
-                    switch (product.trim()) {
-                        case "P1": productDemand[0]++; break;
-                        case "P2": productDemand[1]++; break;
-                        case "P3": productDemand[2]++; break;
-                        case "P4": productDemand[3]++; break;
-                    }
-                }
-                
-                logger.info("CA: Parsed demand vector: P1={}, P2={}, P3={}, P4={}", 
-                        productDemand[0], productDemand[1], productDemand[2], productDemand[3]);
-                
-                negotiationResults.clear();
-                finishedCounter = 0;
-                
-                myAgent.addBehaviour(new RequestProductBundles());
-                myAgent.addBehaviour(new StartNegotiations());
-            } else {
+            if (msg == null) {
                 block();
+                return;
             }
+
+            String content = msg.getContent();
+            logger.info("🎯 CA RECEIVED define-task message: {}", content);
+
+            // If content is START or empty, load config and use static demand; otherwise parse products
+            if (content == null || content.trim().isEmpty() || "START".equalsIgnoreCase(content.trim())) {
+                loadConfigProperties();
+                // default static demand (if your system defines other static product list, adapt here)
+                productDemand = new int[]{1, 1, 1, 1};
+                logger.info("CA: Using fallback static product demand: {}", Arrays.toString(productDemand));
+            } else {
+                parseProductDemand(content);
+            }
+
+            negotiationResults.clear();
+            finishedCounter = 0;
+
+            // request bundles and when reply arrives, start negotiations
+            myAgent.addBehaviour(new RequestProductBundles());
         }
     }
 
-    /**
-     * Estado 2: Solicita os pacotes de produtos (bundles) preferidos ao SDA.
-     */
+    private void loadConfigProperties() {
+        File f = new File("config.properties");
+        if (!f.exists()) {
+            logger.warn("CA: config.properties not found. Using defaults.");
+            return;
+        }
+        try (InputStream in = new FileInputStream(f)) {
+            Properties p = new Properties();
+            p.load(in);
+            logger.info("CA: Loaded config.properties:");
+            for (String key : p.stringPropertyNames()) {
+                logger.info("   {} = {}", key, p.getProperty(key));
+            }
+            // You can use properties to set internal fields if needed.
+        } catch (IOException e) {
+            logger.error("CA: Error loading config.properties", e);
+        }
+    }
+
+    private void parseProductDemand(String productList) {
+        logger.info("CA: Parsing dynamic demand: {}", productList);
+        String[] products = productList.split(",");
+        productDemand = new int[4];
+        for (String product : products) {
+            switch (product.trim()) {
+                case "P1":
+                    productDemand[0]++;
+                    break;
+                case "P2":
+                    productDemand[1]++;
+                    break;
+                case "P3":
+                    productDemand[2]++;
+                    break;
+                case "P4":
+                    productDemand[3]++;
+                    break;
+                default:
+                    logger.warn("CA: Unknown product '{}'", product);
+            }
+        }
+        logger.info("CA: Parsed demand vector: {}", Arrays.toString(productDemand));
+    }
+
     private class RequestProductBundles extends OneShotBehaviour {
+        @Override
         public void action() {
             logger.info("CA: Requesting preferred product bundles from SDA...");
             ACLMessage msg = new ACLMessage(ACLMessage.REQUEST);
@@ -117,133 +141,107 @@ public class CoordinatorAgent extends Agent {
                     MessageTemplate.MatchPerformative(ACLMessage.INFORM),
                     MessageTemplate.MatchProtocol(PROTOCOL_GET_BUNDLES)
             );
-            ACLMessage reply = myAgent.blockingReceive(mt);
+
+            // blockingReceive with timeout to prevent hanging forever
+            ACLMessage reply = myAgent.blockingReceive(mt, 8000);
             if (reply == null) {
-                logger.warn("CA: No reply received for bundle request.");
-                return;
-            }
-            try {
-                // Armazena a lista de pacotes recebida
-                @SuppressWarnings("unchecked")
-                List<ProductBundle> bundles = (List<ProductBundle>) reply.getContentObject();
-                if (bundles != null) {
-                    preferredBundles.addAll(bundles); // Salva na variável do agente
-                    logger.info("CA: Received {} preferred bundles from SDA.", bundles.size());
-                } else {
-                    logger.warn("CA: Received null or empty bundle list from SDA.");
+                logger.warn("CA: No reply from SDA (timeout). Proceeding without preferred bundles.");
+            } else {
+                try {
+                    Object content = reply.getContentObject();
+                    if (content instanceof List<?>) {
+                        List<?> list = (List<?>) content;
+                        preferredBundles.clear();
+                        for (Object o : list) {
+                            if (o instanceof ProductBundle) preferredBundles.add((ProductBundle) o);
+                        }
+                        logger.info("CA: Received {} preferred bundles from SDA.", preferredBundles.size());
+                    } else {
+                        logger.warn("CA: Unexpected reply content from SDA.");
+                    }
+                } catch (UnreadableException e) {
+                    logger.error("CA: Failed to read bundles from SDA.", e);
                 }
-            } catch (UnreadableException e) {
-                logger.error("CA: Failed to read bundles object from SDA.", e);
             }
+
+            // Now start negotiations (buyers creation)
+            myAgent.addBehaviour(new StartNegotiations());
         }
     }
 
-    /**
-     * Estado 3: Identifica SAs e cria um BA para cada um, iniciando a fase de barganha.
-     */
     private class StartNegotiations extends OneShotBehaviour {
+        @Override
         public void action() {
-            logger.info("CA: Preparation complete. Starting negotiation orchestration...");
-            
+            logger.info("CA: Starting negotiations...");
+
             finishedCounter = 0;
             negotiationResults.clear();
-            
-            sellerAgents = new ArrayList<>();
-            sellerAgents.add(new AID("s1", AID.ISLOCALNAME));
-            sellerAgents.add(new AID("s2", AID.ISLOCALNAME));
-            sellerAgents.add(new AID("s3", AID.ISLOCALNAME));
 
-            for (AID seller : sellerAgents) {
-                createBuyerFor(seller);
-            }
-            
+            sellerAgents = Arrays.asList(
+                    new AID("s1", AID.ISLOCALNAME),
+                    new AID("s2", AID.ISLOCALNAME),
+                    new AID("s3", AID.ISLOCALNAME)
+            );
+
+            for (AID seller : sellerAgents) createBuyerFor(seller);
+
+            // Start waiting results behavior
             myAgent.addBehaviour(new WaitForResults());
         }
     }
 
-    // --- Métodos e Comportamentos de Orquestração ---
-
-    /**
-     * Cria e inicia um novo BuyerAgent, passando os AIDs do Vendedor e do Coordenador.
-     *
-     * @param sellerAgent O AID do Vendedor com quem o BA deve negociar.
-     */
     private void createBuyerFor(AID sellerAgent) {
         String buyerName = "buyer_for_" + sellerAgent.getLocalName() + "_" + System.currentTimeMillis();
-        logger.info("CA: Creating {} to negotiate with {}", buyerName, sellerAgent.getLocalName());
-
+        logger.info("CA: Creating buyer {} for seller {}", buyerName, sellerAgent.getLocalName());
         try {
-            Object[] args = new Object[]{
-                    sellerAgent,
-                    getAID(),
-            };
-
-            AgentController buyerController = getContainerController().createNewAgent(
-                    buyerName,
-                    "mas.agents.BuyerAgent",
-                    args
-            );
-            buyerController.start();
-            logger.debug("CA: Buyer agent {} started successfully.", buyerName);
+            Object[] args = new Object[]{sellerAgent, getAID()};
+            AgentController ac = getContainerController().createNewAgent(buyerName, "mas.agents.BuyerAgent", args);
+            ac.start();
         } catch (StaleProxyException e) {
-            logger.error("CA: Failed to create/start buyer agent " + buyerName, e);
+            logger.error("CA: Failed to start buyer {}", buyerName, e);
         }
     }
 
-    /**
-     * Comportamento (Ticker) que coleta os resultados das negociações bilaterais.
-     * Quando todos os BAs terminam, ele aciona o WinnerDeterminationService.
-     */
     private class WaitForResults extends TickerBehaviour {
-        public WaitForResults() {
-            super(CoordinatorAgent.this, 1000);
-        }
+        public WaitForResults() { super(CoordinatorAgent.this, 1000); }
 
+        @Override
         protected void onTick() {
             MessageTemplate mt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.INFORM),
                     MessageTemplate.MatchProtocol(PROTOCOL_REPORT_RESULT)
             );
             ACLMessage msg = myAgent.receive(mt);
-
             if (msg != null) {
-                finishedCounter++;
                 try {
-                    Object content = msg.getContentObject();
-                    if (content instanceof NegotiationResult) {
-                        NegotiationResult result = (NegotiationResult) content;
-                        negotiationResults.add(result);
-                        logger.info("CA: Result received from {} -> {}", msg.getSender().getLocalName(), result);
+                    Object obj = msg.getContentObject();
+                    if (obj instanceof NegotiationResult) {
+                        negotiationResults.add((NegotiationResult) obj);
+                        logger.info("CA: Received negotiation result from {}", msg.getSender().getLocalName());
                     } else {
-                        logger.info("CA: Notification received from {} -> {}", msg.getSender().getLocalName(), msg.getContent());
+                        logger.info("CA: Received non-object inform from {}", msg.getSender().getLocalName());
                     }
                 } catch (UnreadableException e) {
-                    logger.warn("CA: Received non-object notification from {}", msg.getSender().getLocalName());
+                    logger.warn("CA: Could not read message from {}", msg.getSender().getLocalName());
                 }
+                finishedCounter++;
             }
 
             if (finishedCounter >= (sellerAgents == null ? 0 : sellerAgents.size())) {
                 logger.info("--- CA: All negotiations concluded. Determining winners... ---");
-
-                List<NegotiationResult> optimalSolution = wds.solveWDPWithBranchAndBound(negotiationResults, productDemand);
-
-                logger.info("\n--- OPTIMAL SOLUTION FOUND ---");
-                if (optimalSolution == null || optimalSolution.isEmpty()) {
-                    logger.info("No combination of bids could satisfy the demand.");
+                List<NegotiationResult> optimal = wds.solveWDPWithBranchAndBound(negotiationResults, productDemand);
+                if (optimal == null || optimal.isEmpty()) {
+                    logger.info("CA: No combination of bids could satisfy the demand.");
                 } else {
-                    double totalUtility = 0;
-                    for (NegotiationResult res : optimalSolution) {
-                        logger.info("-> {}", res);
-                        totalUtility += res.getUtility();
-                    }
-                    logger.info("Total Maximized Utility: {:.3f}", totalUtility);
+                    double tot = optimal.stream().mapToDouble(NegotiationResult::getUtility).sum();
+                    logger.info("CA: Optimal solution (total utility = {})", tot);
+                    for (NegotiationResult r : optimal) logger.info("CA Winner -> {}", r);
                 }
-
+                // reset to allow new cycles in future (do not stop agent outright)
                 negotiationResults.clear();
                 finishedCounter = 0;
-                
-                stop();
             }
         }
     }
 }
+

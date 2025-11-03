@@ -18,7 +18,7 @@ public class TaskDecomposerAgent extends Agent {
     
     private final String[][] DEMAND_SCENARIOS = {
         {"P1,P2,P3,P4"},
-        {"P1,P2"},
+        {"P1"},
         {"P1,P3"},
         {"P2,P4"},
         {"P1,P1,P2"}  

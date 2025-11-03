@@ -14,6 +14,7 @@ public class App {
         ContainerController cc = rt.createMainContainer(p);
 
         // Create agents
+        AgentController httpBridge = cc.createNewAgent("httpbridge", "mas.agents.HttpBridgeAgent", null);
         AgentController ca = cc.createNewAgent("ca", "mas.agents.CoordinatorAgent", null);
         AgentController sda = cc.createNewAgent("sda", "mas.agents.SynergyDeterminationAgent", null);
         AgentController tda = cc.createNewAgent("tda", "mas.agents.TaskDecomposerAgent", null);
@@ -22,6 +23,7 @@ public class App {
         AgentController s3 = cc.createNewAgent("s3", "mas.agents.SellerAgent", null);
 
         // Start agents
+        httpBridge.start();
         ca.start();
         sda.start();
         tda.start();
