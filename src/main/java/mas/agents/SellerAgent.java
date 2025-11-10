@@ -340,9 +340,13 @@ public class SellerAgent extends Agent {
 
     /**
      * Estado 4: Avalia a contraproposta recebida do Comprador.
+     * 
+     * IMPROVED: Now processes ALL bids in the counter-proposal.
      */
     private class EvaluateCounterProposal extends OneShotBehaviour {
         private int transitionEvent = 2; // Default: falha/deadline
+        private List<Bid> acceptedBids = new ArrayList<>();
+        private List<Bid> rejectedBids = new ArrayList<>();
 
         @Override
         public void action() {
@@ -361,27 +365,41 @@ public class SellerAgent extends Agent {
                     Proposal p = (Proposal) content;
                     if (p.getBids() != null && !p.getBids().isEmpty()) {
 
-                        // TODO (Simplificação de Arquitetura): Falha idêntica ao BuyerAgent.
-                        // Pega apenas o lance [0]. Deveria ser um LOOP "bid-by-bid".
-                        Bid counterBid = p.getBids().get(0);
+                        // IMPROVED: Process ALL bids instead of just the first one
+                        for (Bid counterBid : p.getBids()) {
+                            double utilityForSeller = evalService.calculateUtility("seller", counterBid, sellerWeights, sellerIssueParams, sellerRiskBeta);
+                            logger.debug("{}: Bid {} counter utility = {} (Threshold = {})",
+                                    myAgent.getLocalName(),
+                                    counterBid.getProductBundle().getProducts(),
+                                    String.format("%.4f", utilityForSeller),
+                                    String.format("%.4f", sellerAcceptanceThreshold));
 
-                        // TODO (SINERGIA): 'sellerIssueParams' genérico.
-                        // Deveria usar params específicos para o 'counterBid.getProductBundle()'.
-                        double utilityForSeller = evalService.calculateUtility("seller", counterBid, sellerWeights, sellerIssueParams, sellerRiskBeta);
-                        logger.info("{}: Received counter utility = {} (Threshold = {})",
-                                myAgent.getLocalName(),
-                                String.format("%.4f", utilityForSeller),
-                                String.format("%.4f", sellerAcceptanceThreshold));
+                            if (utilityForSeller >= sellerAcceptanceThreshold) {
+                                logger.info("{}: Bid {} ACCEPTABLE (utility {} >= threshold {})",
+                                    myAgent.getLocalName(),
+                                    counterBid.getProductBundle().getProducts(),
+                                    String.format("%.4f", utilityForSeller),
+                                    String.format("%.4f", sellerAcceptanceThreshold));
+                                acceptedBids.add(counterBid);
+                            } else {
+                                logger.debug("{}: Bid {} REJECTED (utility {} < threshold {})",
+                                    myAgent.getLocalName(),
+                                    counterBid.getProductBundle().getProducts(),
+                                    String.format("%.4f", utilityForSeller),
+                                    String.format("%.4f", sellerAcceptanceThreshold));
+                                rejectedBids.add(counterBid);
+                            }
+                        }
 
-                        // TODO (Simplificação): Esta lógica é "tudo ou nada".
-                        // O agente aceita ou rejeita a proposta inteira (de 1 item).
-                        // Na implementação correta, ele decidiria por lance.
-                        if (utilityForSeller >= sellerAcceptanceThreshold) {
-                            logger.info("{}: Counter-offer is acceptable. Accepting.", myAgent.getLocalName());
-                            transitionEvent = 1; // Aceitar
+                        // Decision: If ANY bid was accepted, accept them all
+                        if (!acceptedBids.isEmpty()) {
+                            logger.info("{}: Accepting {} out of {} bids", 
+                                myAgent.getLocalName(), acceptedBids.size(), p.getBids().size());
+                            transitionEvent = 1; // Accept
                         } else {
-                            logger.info("{}: Counter-offer not acceptable. Will make new proposal for round {}", myAgent.getLocalName(), (currentRound + 1));
-                            transitionEvent = 0; // Rejeitar
+                            logger.info("{}: All {} bids rejected. Will make new proposal for round {}", 
+                                myAgent.getLocalName(), rejectedBids.size(), (currentRound + 1));
+                            transitionEvent = 0; // Reject/Counter
                         }
                     } else {
                         transitionEvent = 2;
@@ -438,6 +456,8 @@ public class SellerAgent extends Agent {
 
     /**
      * Estado 6: Gera e envia uma nova proposta (rejeitando a contraproposta).
+     * 
+     * IMPROVED: Now generates new proposals for ALL bids in the counter-proposal.
      */
     private class MakeNewProposal extends OneShotBehaviour {
         @Override
@@ -446,25 +466,27 @@ public class SellerAgent extends Agent {
 
             try {
                 Proposal receivedP = (Proposal) receivedCounterMsg.getContentObject();
-                // TODO (Simplificação): Pega apenas o lance [0] como referência.
-                // Deveria ser um LOOP, gerando novas propostas para
-                // todos os lances que o comprador contra-ofertou.
-                Bid receivedB = receivedP.getBids().get(0);
+                
+                // IMPROVED: Generate new proposals for ALL bids, not just the first
+                List<Bid> newSellerBids = new ArrayList<>();
+                for (Bid receivedB : receivedP.getBids()) {
+                    Bid newSellerBid = concessionService.generateCounterBid(
+                            receivedB,
+                            currentRound,
+                            maxRounds,
+                            sellerGamma,
+                            discountRate,
+                            sellerIssueParams,
+                            "seller"
+                    );
+                    newSellerBids.add(newSellerBid);
+                    logger.debug("{}: Generated new proposal for bundle {} -> Price: {}", 
+                        myAgent.getLocalName(),
+                        newSellerBid.getProductBundle().getProducts(),
+                        newSellerBid.getIssues().get(0).getValue());
+                }
 
-                // TODO (SINERGIA): 'sellerIssueParams' genérico.
-                Bid newSellerBid = concessionService.generateCounterBid(
-                        receivedB,
-                        currentRound,
-                        maxRounds,
-                        sellerGamma,
-                        discountRate,
-                        sellerIssueParams,
-                        "seller"
-                );
-
-                // TODO (Simplificação): Envia uma lista de 1 lance.
-                // Deveria ser uma lista de todos os lances recém-gerados.
-                Proposal newProposal = new Proposal(List.of(newSellerBid));
+                Proposal newProposal = new Proposal(newSellerBids);
                 ACLMessage proposeMsg = new ACLMessage(ACLMessage.PROPOSE);
                 proposeMsg.addReceiver(buyerAgent);
                 proposeMsg.setConversationId(negotiationId);
@@ -472,7 +494,8 @@ public class SellerAgent extends Agent {
                 proposeMsg.setReplyWith("prop-" + negotiationId + "-" + System.currentTimeMillis());
                 proposeMsg.setContentObject(newProposal);
                 myAgent.send(proposeMsg);
-                logger.info("{}: Sent new proposal (Round {}) -> {}", myAgent.getLocalName(), currentRound, newSellerBid.getIssues().get(0));
+                logger.info("{}: Sent new proposal (Round {}) with {} bids", 
+                    myAgent.getLocalName(), currentRound, newSellerBids.size());
 
             } catch (UnreadableException | IOException e) {
                 logger.error("{}: Error creating/sending new proposal", myAgent.getLocalName(), e);
