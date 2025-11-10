@@ -2,6 +2,8 @@ package mas.logic;
 
 import mas.models.Bid;
 import mas.models.NegotiationIssue;
+import mas.models.ProductBundle;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,14 +40,15 @@ public class EvaluationService {
     }
 
     /**
-     * Backwards-compatible overload: mantém a assinatura antiga usada por testes/consumidores
+     * Backwards-compatible overload: mantém a assinatura antiga usada por
+     * testes/consumidores
      * que não informam o agentType. Por padrão assume 'buyer'.
+     * 
      * @deprecated Preferir a versão com agentType explícito.
      */
     @Deprecated
-    public double calculateUtility(Bid bid, Map<String, Double> weights,
-                                   Map<String, IssueParameters> issueParams, double riskBeta) {
-        return calculateUtility("buyer", bid, weights, issueParams, riskBeta);
+    public double calculateUtility(String agentType, Bid bid, Map<String, Double> weights, double riskBeta) {
+        return calculateUtility("buyer", "buyer", bid, weights, riskBeta);
     }
 
     /**
@@ -58,49 +61,67 @@ public class EvaluationService {
      * @param riskBeta    O fator de risco (β) do agente.
      * @return A utilidade total (0-1).
      */
-    public double calculateUtility(String agentType, Bid bid, Map<String, Double> weights,
-                                   Map<String, IssueParameters> issueParams, double riskBeta) {
+    public double calculateUtility(String agentType, String agentName, Bid bid, Map<String, Double> weights,
+            double riskBeta) {
         double totalUtility = 0.0;
 
-        if (bid == null || bid.getIssues() == null) { /* ... (tratamento de erro) ... */
+        if (bid == null || bid.getIssues() == null)
             return 0.0;
-        }
-        if (weights == null || issueParams == null) { /* ... (tratamento de erro) ... */
+        if (weights == null)
             return 0.0;
-        }
 
-        // TODO (SINERGIA): O 'issueParams' recebido aqui é genérico.
-        // A implementação correta exigiria que o AGENTE (Buyer/Seller)
-        // passasse um 'issueParams' específico para o 'bid.getProductBundle()'.
-        // Ou, este método precisaria de uma lógica para buscar os
-        // parâmetros corretos (ex: 'params.1100.price') com base no
-        // 'bid.getProductBundle()'.
-        // A lógica de avaliação atual ignora a sinergia.
-
+        ConfigLoader config = ConfigLoader.getInstance();
+        String bundleId = getBundleId(bid.getProductBundle());
         for (NegotiationIssue issue : bid.getIssues()) {
-            if (issue == null || issue.getName() == null) continue;
+            if (issue == null || issue.getName() == null)
+                continue;
 
             String issueName = issue.getName().toLowerCase();
             double weight = weights.getOrDefault(issueName, 0.0);
 
-            if (Math.abs(weight) < 1e-9) continue;
+            if (Math.abs(weight) < 1e-9)
+                continue;
+            IssueParameters params;
+            if (issue.getValue() instanceof String) {
+                // Issue qualitativo (não precisa de min/max)
+                params = new IssueParameters(0, 1, IssueType.QUALITATIVE);
+            } else {
+                // Issue quantitativo
+                IssueType type = (issueName.equals("price") || issueName.equals("delivery")) ? IssueType.COST
+                        : IssueType.BENEFIT;
 
-            // Pega o parâmetro (min/max) genérico
-            IssueParameters params = issueParams.get(issueName);
+                // Busca os parâmetros específicos do pacote
+                params = config.getSynergyParams(agentType, agentName, bundleId, issueName, type);
+            }
+
             if (params == null) {
+                logger.warn("{}: Não foram encontrados parâmetros de sinergia para {} (bundle: {}, issue: {})",
+                        agentType, agentType, bundleId, issueName);
                 continue;
             }
 
+            // O resto da lógica funciona como antes
             double normalizedUtility = normalizeIssueUtility(agentType, issue, params, riskBeta);
             totalUtility += weight * normalizedUtility;
         }
         return Math.max(0.0, Math.min(1.0, totalUtility));
     }
 
+    private String getBundleId(ProductBundle pb) {
+        if (pb == null || pb.getProducts() == null)
+            return "default";
+        StringBuilder sb = new StringBuilder();
+        for (int p : pb.getProducts()) {
+            sb.append(p);
+        }
+        return sb.toString();
+    }
+
     /**
      * Normaliza a utilidade de um único issue (Qualitativo ou Quantitativo).
      */
-    private double normalizeIssueUtility(String agentType, NegotiationIssue issue, IssueParameters params, double riskBeta) {
+    private double normalizeIssueUtility(String agentType, NegotiationIssue issue, IssueParameters params,
+            double riskBeta) {
         Object value = issue.getValue();
         if (value == null) { /* ... (tratamento de erro) ... */
             return 0.0;
@@ -136,7 +157,8 @@ public class EvaluationService {
             tfn = tfnMap.get(lookupKey.replace(" ", "_"));
         }
         if (tfn == null) {
-            logger.warn("EvaluationService Warning: Unknown linguistic term '{}' for agent type '{}'.", linguisticValue, agentType);
+            logger.warn("EvaluationService Warning: Unknown linguistic term '{}' for agent type '{}'.", linguisticValue,
+                    agentType);
             return 0.0;
         }
         return (tfn[0] + 4 * tfn[1] + tfn[2]) / 6.0;
@@ -157,8 +179,10 @@ public class EvaluationService {
 
         if (Math.abs(range) < 1e-9) {
             double v_min_boundary = 0.1;
-            if (params.getType() == IssueType.COST && value <= min) return 1.0;
-            if (params.getType() == IssueType.BENEFIT && value >= min) return 1.0;
+            if (params.getType() == IssueType.COST && value <= min)
+                return 1.0;
+            if (params.getType() == IssueType.BENEFIT && value >= min)
+                return 1.0;
             return v_min_boundary;
         }
         double v_min = 0.1;
@@ -178,10 +202,12 @@ public class EvaluationService {
         if (riskBeta == 1.0) { // Neutro
             return v_min + (1 - v_min) * ratio;
         } else if (riskBeta < 1.0) { // Propenso a risco (Eq. 1)
-            if (ratio == 0.0) return v_min;
+            if (ratio == 0.0)
+                return v_min;
             return v_min + (1 - v_min) * Math.pow(ratio, 1.0 / riskBeta);
         } else { // Averso a risco (Eq. 2)
-            if (ratio == 1.0) return 1.0;
+            if (ratio == 1.0)
+                return 1.0;
             return Math.exp(Math.pow(1 - ratio, riskBeta) * Math.log(v_min));
         }
     }
@@ -233,7 +259,7 @@ public class EvaluationService {
      * Esta implementação está CORRETA.
      */
     private void loadTfnsFromConfig(ConfigLoader config, String prefix, Map<String, double[]> map) {
-        String[] terms = {"very_poor", "poor", "medium", "good", "very_good"};
+        String[] terms = { "very_poor", "poor", "medium", "good", "very_good" };
         for (String term : terms) {
             String key = "tfn." + prefix + "." + term;
             String value = config.getString(key);
@@ -247,12 +273,13 @@ public class EvaluationService {
                         String withSpace = term.replace("_", " ").toLowerCase();
                         String withUnderscore = term.toLowerCase();
                         String compact = withSpace.replace(" ", "");
-                        double[] arr = new double[]{m1, m2, m3};
+                        double[] arr = new double[] { m1, m2, m3 };
                         map.put(withSpace, arr);
                         map.put(withUnderscore, arr);
                         map.put(compact, arr);
                     } catch (NumberFormatException e) {
-                        logger.error("EvaluationService: Error parsing TFN from config for key '{}', value: '{}'", key, value);
+                        logger.error("EvaluationService: Error parsing TFN from config for key '{}', value: '{}'", key,
+                                value);
                     }
                 } else {
                     logger.error("EvaluationService: Invalid TFN format in config for key '{}'", key);

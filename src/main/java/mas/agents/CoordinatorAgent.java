@@ -52,8 +52,7 @@ public class CoordinatorAgent extends Agent {
         public void action() {
             MessageTemplate mt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.REQUEST),
-                    MessageTemplate.MatchProtocol(PROTOCOL_DEFINE_TASK)
-            );
+                    MessageTemplate.MatchProtocol(PROTOCOL_DEFINE_TASK));
             ACLMessage msg = myAgent.receive(mt);
 
             if (msg == null) {
@@ -64,11 +63,13 @@ public class CoordinatorAgent extends Agent {
             String content = msg.getContent();
             logger.info("🎯 CA RECEIVED define-task message: {}", content);
 
-            // If content is START or empty, load config and use static demand; otherwise parse products
+            // If content is START or empty, load config and use static demand; otherwise
+            // parse products
             if (content == null || content.trim().isEmpty() || "START".equalsIgnoreCase(content.trim())) {
                 loadConfigProperties();
-                // default static demand (if your system defines other static product list, adapt here)
-                productDemand = new int[]{1, 1, 1, 1};
+                // default static demand (if your system defines other static product list,
+                // adapt here)
+                productDemand = new int[] { 1, 1, 1, 1 };
                 logger.info("CA: Using fallback static product demand: {}", Arrays.toString(productDemand));
             } else {
                 parseProductDemand(content);
@@ -139,8 +140,7 @@ public class CoordinatorAgent extends Agent {
 
             MessageTemplate mt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.INFORM),
-                    MessageTemplate.MatchProtocol(PROTOCOL_GET_BUNDLES)
-            );
+                    MessageTemplate.MatchProtocol(PROTOCOL_GET_BUNDLES));
 
             // blockingReceive with timeout to prevent hanging forever
             ACLMessage reply = myAgent.blockingReceive(mt, 8000);
@@ -153,7 +153,8 @@ public class CoordinatorAgent extends Agent {
                         List<?> list = (List<?>) content;
                         preferredBundles.clear();
                         for (Object o : list) {
-                            if (o instanceof ProductBundle) preferredBundles.add((ProductBundle) o);
+                            if (o instanceof ProductBundle)
+                                preferredBundles.add((ProductBundle) o);
                         }
                         logger.info("CA: Received {} preferred bundles from SDA.", preferredBundles.size());
                     } else {
@@ -180,10 +181,10 @@ public class CoordinatorAgent extends Agent {
             sellerAgents = Arrays.asList(
                     new AID("s1", AID.ISLOCALNAME),
                     new AID("s2", AID.ISLOCALNAME),
-                    new AID("s3", AID.ISLOCALNAME)
-            );
+                    new AID("s3", AID.ISLOCALNAME));
 
-            for (AID seller : sellerAgents) createBuyerFor(seller);
+            for (AID seller : sellerAgents)
+                createBuyerFor(seller);
 
             // Start waiting results behavior
             myAgent.addBehaviour(new WaitForResults());
@@ -194,7 +195,7 @@ public class CoordinatorAgent extends Agent {
         String buyerName = "buyer_for_" + sellerAgent.getLocalName() + "_" + System.currentTimeMillis();
         logger.info("CA: Creating buyer {} for seller {}", buyerName, sellerAgent.getLocalName());
         try {
-            Object[] args = new Object[]{sellerAgent, getAID()};
+            Object[] args = new Object[] { sellerAgent, getAID() };
             AgentController ac = getContainerController().createNewAgent(buyerName, "mas.agents.BuyerAgent", args);
             ac.start();
         } catch (StaleProxyException e) {
@@ -203,45 +204,94 @@ public class CoordinatorAgent extends Agent {
     }
 
     private class WaitForResults extends TickerBehaviour {
-        public WaitForResults() { super(CoordinatorAgent.this, 1000); }
+        public WaitForResults() {
+            super(CoordinatorAgent.this, 1000);
+        }
 
         @Override
         protected void onTick() {
             MessageTemplate mt = MessageTemplate.and(
                     MessageTemplate.MatchPerformative(ACLMessage.INFORM),
-                    MessageTemplate.MatchProtocol(PROTOCOL_REPORT_RESULT)
-            );
+                    MessageTemplate.MatchProtocol(PROTOCOL_REPORT_RESULT));
             ACLMessage msg = myAgent.receive(mt);
+
+            // Se uma mensagem for recebida, processe-a
             if (msg != null) {
+                Object content = null;
+                boolean messageHandled = false;
+
                 try {
-                    Object obj = msg.getContentObject();
-                    if (obj instanceof NegotiationResult) {
-                        negotiationResults.add((NegotiationResult) obj);
-                        logger.info("CA: Received negotiation result from {}", msg.getSender().getLocalName());
-                    } else {
-                        logger.info("CA: Received non-object inform from {}", msg.getSender().getLocalName());
-                    }
-                } catch (UnreadableException e) {
-                    logger.warn("CA: Could not read message from {}", msg.getSender().getLocalName());
+                    // Primeiro, tenta ler como um objeto
+                    content = msg.getContentObject();
+                } catch (UnreadableException e1) {
+                    // Se falhar, é provável que seja uma String (ex: falha)
+                    content = msg.getContent();
                 }
-                finishedCounter++;
+
+                // Agora, verifica o que recebemos
+                if (content instanceof List) {
+                    // SUCESSO: Recebemos uma lista de resultados
+                    try {
+                        List<?> resultsList = (List<?>) content;
+                        int added = 0;
+                        for (Object o : resultsList) {
+                            if (o instanceof NegotiationResult) {
+                                negotiationResults.add((NegotiationResult) o);
+                                added++;
+                            }
+                        }
+                        logger.info("CA: Received SUCCESS result from {} ({} bids).",
+                                msg.getSender().getLocalName(), added);
+                        finishedCounter++; // Incrementa UMA VEZ por agente
+                        messageHandled = true;
+                    } catch (Exception e) {
+                        logger.error("CA: Error processing results list from {}", msg.getSender().getLocalName(), e);
+                    }
+                } else if ("NegotiationFailed".equals(content)) {
+                    // FALHA: Recebemos a string de falha
+                    logger.warn("CA: Received 'NegotiationFailed' from {}", msg.getSender().getLocalName());
+                    finishedCounter++; // Incrementa UMA VEZ por agente
+                    messageHandled = true;
+                } else if (content instanceof NegotiationResult) {
+                    // AVISO: Lógica antiga (deixado por segurança)
+                    logger.warn("CA: Received single NegotiationResult (legacy) from {}",
+                            msg.getSender().getLocalName());
+                    negotiationResults.add((NegotiationResult) content);
+                    finishedCounter++; // Incrementa UMA VEZ por agente
+                    messageHandled = true;
+                } else {
+                    // Mensagem desconhecida ou corrupta
+                    logger.error("CA: Received unknown/corrupt message from {}. Content: {}",
+                            msg.getSender().getLocalName(), msg.getContent());
+                    // Não incrementa o contador, espera o timeout do agente
+                }
             }
 
-            if (finishedCounter >= (sellerAgents == null ? 0 : sellerAgents.size())) {
+            // Verifica se TODOS os agentes (sucesso OU falha) terminaram
+            if (sellerAgents != null && finishedCounter >= sellerAgents.size()) {
                 logger.info("--- CA: All negotiations concluded. Determining winners... ---");
+
+                if (negotiationResults.isEmpty()) {
+                    logger.warn("CA: No successful bids were submitted.");
+                }
+
                 List<NegotiationResult> optimal = wds.solveWDPWithBranchAndBound(negotiationResults, productDemand);
                 if (optimal == null || optimal.isEmpty()) {
-                    logger.info("CA: No combination of bids could satisfy the demand.");
+                    logger.info("CA: No combination of bids could satisfy the demand {}.",
+                            Arrays.toString(productDemand));
                 } else {
                     double tot = optimal.stream().mapToDouble(NegotiationResult::getUtility).sum();
-                    logger.info("CA: Optimal solution (total utility = {})", tot);
-                    for (NegotiationResult r : optimal) logger.info("CA Winner -> {}", r);
+                    logger.info("CA: Optimal solution (total utility = {}) for demand {}",
+                            String.format("%.4f", tot), Arrays.toString(productDemand));
+                    for (NegotiationResult r : optimal) {
+                        logger.info("CA Winner -> {}", r);
+                    }
                 }
-                // reset to allow new cycles in future (do not stop agent outright)
-                negotiationResults.clear();
-                finishedCounter = 0;
+
+                // Para o TickerBehaviour E se prepara para o próximo ciclo do TDA
+                stop();
+                logger.info("--- CA: Cycle complete. Waiting for new task from TDA. ---");
             }
         }
     }
 }
-
