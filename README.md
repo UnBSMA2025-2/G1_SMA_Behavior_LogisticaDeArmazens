@@ -1,6 +1,6 @@
 # Agente Livre
 
-<img alt="agente_livre" src="https://github.com/user-attachments/assets/87d65a82-9fc1-48cb-830d-29f7a92f4964" />
+<img alt="agente_livre" src="assets/agente_livre.png" style="width:100%;max-width:100%;height:auto;" />
 
 
 **Disciplina**: FGA0053 - Sistemas Multiagentes <br>
