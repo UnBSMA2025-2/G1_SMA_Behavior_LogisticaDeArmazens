@@ -33,12 +33,6 @@ public class ConcessionService {
 
         List<NegotiationIssue> counterIssues = new ArrayList<>();
 
-        // TODO (SINERGIA): O 'issueParams' recebido aqui é genérico.
-        // A implementação correta exige que o AGENTE (Buyer/Seller)
-        // passe um 'issueParams' específico para o 'referenceBid.getProductBundle()'.
-        // O ConcessionService está cego para a sinergia, pois seus [min, max]
-        // são os mesmos para todos os pacotes.
-
         for (NegotiationIssue issue : referenceBid.getIssues()) {
             String issueName = issue.getName().toLowerCase();
             IssueParameters params = issueParams.get(issueName); // Pega params genéricos
@@ -46,23 +40,17 @@ public class ConcessionService {
                 counterIssues.add(new NegotiationIssue(issue.getName(), issue.getValue()));
                 continue;
             }
-
-            // Calcula a taxa de concessão (Eq. 5)
             double concessionRate = calculateConcessionRate(currentRound, maxRounds, gamma, discountRate);
 
             Object newValue;
             if (params.getType() == IssueType.QUALITATIVE) {
-                // Mapeia a taxa de concessão (0..1) para um valor linguístico
                 newValue = mapConcessionToQualitative(concessionRate, agentType);
             } else {
-                // Calcula o novo valor quantitativo (Eq. 6)
                 newValue = calculateNewQuantitativeValue(concessionRate, params.getMin(), params.getMax(), params.getType(), agentType);
             }
 
             counterIssues.add(new NegotiationIssue(issue.getName(), newValue));
         }
-
-        // Retorna um novo lance para o MESMO ProductBundle e Quantidades
         return new Bid(referenceBid.getProductBundle(), counterIssues, referenceBid.getQuantities());
     }
 
@@ -92,9 +80,6 @@ public class ConcessionService {
      * A lógica de direção (buyer/seller, cost/benefit) está CORRETA.
      */
     private double calculateNewQuantitativeValue(double concessionRate, double min_k, double max_k, IssueType type, String agentType) {
-        // TODO (SINERGIA): 'min_k' e 'max_k' são genéricos.
-        // Eles deveriam ser os limites específicos do ProductBundle
-        // que está sendo negociado.
         double range = max_k - min_k;
 
         if (Math.abs(range) < 1e-9) {
@@ -103,14 +88,12 @@ public class ConcessionService {
 
         double newValue;
         if (agentType.equalsIgnoreCase("buyer")) {
-            // Comprador: Cede do seu 'melhor' (min custo) para o 'pior' (max custo)
             if (type == IssueType.BENEFIT) { // max -> min
                 newValue = max_k - concessionRate * range;
             } else { // COST - min -> max
                 newValue = min_k + concessionRate * range;
             }
         } else { // "seller"
-            // Vendedor: Cede do seu 'melhor' (max preço) para o 'pior' (min preço)
             if (type == IssueType.BENEFIT) { // min -> max
                 newValue = min_k + concessionRate * range;
             } else { // COST - max -> min
@@ -128,10 +111,8 @@ public class ConcessionService {
     private String mapConcessionToQualitative(double concessionRate, String agentType) {
         double targetValue;
         if (agentType.equalsIgnoreCase("buyer")) {
-            // Comprador cede de VG (1.0) para VP (0.0)
             targetValue = 1.0 - concessionRate;
         } else { // seller
-            // Vendedor cede de VP (0.0) para VG (1.0)
             targetValue = concessionRate;
         }
 

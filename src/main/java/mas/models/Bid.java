@@ -10,8 +10,6 @@ import java.util.List;
  */
 public class Bid implements Serializable {
     private static final long serialVersionUID = 1L;
-    
-    //Bid = ⟨PB, I1,...,Ik, Q⟩
     private final ProductBundle productBundle; // PB
     private final List<NegotiationIssue> issues; // I1, ..., Ik
     private final int[] quantities; // Q

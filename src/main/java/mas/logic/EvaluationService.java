@@ -24,8 +24,6 @@ import java.util.Map;
 public class EvaluationService {
 
     private static final Logger logger = LoggerFactory.getLogger(EvaluationService.class);
-
-    // Mapas para armazenar TFNs carregados (Correto)
     private final Map<String, double[]> tfnMapBuyer;
     private final Map<String, double[]> tfnMapSeller;
 
@@ -69,14 +67,6 @@ public class EvaluationService {
             return 0.0;
         }
 
-        // TODO (SINERGIA): O 'issueParams' recebido aqui é genérico.
-        // A implementação correta exigiria que o AGENTE (Buyer/Seller)
-        // passasse um 'issueParams' específico para o 'bid.getProductBundle()'.
-        // Ou, este método precisaria de uma lógica para buscar os
-        // parâmetros corretos (ex: 'params.1100.price') com base no
-        // 'bid.getProductBundle()'.
-        // A lógica de avaliação atual ignora a sinergia.
-
         for (NegotiationIssue issue : bid.getIssues()) {
             if (issue == null || issue.getName() == null) continue;
 
@@ -84,8 +74,6 @@ public class EvaluationService {
             double weight = weights.getOrDefault(issueName, 0.0);
 
             if (Math.abs(weight) < 1e-9) continue;
-
-            // Pega o parâmetro (min/max) genérico
             IssueParameters params = issueParams.get(issueName);
             if (params == null) {
                 continue;
@@ -108,14 +96,12 @@ public class EvaluationService {
 
         if (params.getType() == IssueType.QUALITATIVE) {
             if (value instanceof String) {
-                // A normalização qualitativa (Eq. 3) está correta.
                 return normalizeQualitativeUtility(agentType, (String) value);
             } else { /* ... (tratamento de erro) ... */
                 return 0.0;
             }
         } else {
             if (value instanceof Number) {
-                // A normalização quantitativa usa os 'params' genéricos.
                 return normalizeQuantitativeUtility(((Number) value).doubleValue(), params, riskBeta);
             } else { /* ... (tratamento de erro) ... */
                 return 0.0;
@@ -131,7 +117,6 @@ public class EvaluationService {
         Map<String, double[]> tfnMap = agentType.equalsIgnoreCase("seller") ? this.tfnMapSeller : this.tfnMapBuyer;
         String lookupKey = linguisticValue.replace("_", " ").trim().toLowerCase();
         double[] tfn = tfnMap.get(lookupKey);
-        // ... (Fallbacks) ...
         if (tfn == null) {
             tfn = tfnMap.get(lookupKey.replace(" ", "_"));
         }
@@ -148,9 +133,6 @@ public class EvaluationService {
      * usa parâmetros (min/max) genéricos.
      */
     private double normalizeQuantitativeUtility(double value, IssueParameters params, double riskBeta) {
-        // TODO (SINERGIA): 'params' (min/max) são genéricos.
-        // A lógica de sinergia exige que [min, max] sejam
-        // específicos do ProductBundle que está sendo avaliado.
         double min = params.getMin();
         double max = params.getMax();
         double range = max - min;
@@ -185,8 +167,6 @@ public class EvaluationService {
             return Math.exp(Math.pow(1 - ratio, riskBeta) * Math.log(v_min));
         }
     }
-
-    // --- Classes Internas (IssueParameters, IssueType) ---
 
     /**
      * Classe auxiliar para armazenar os parâmetros de um issue.

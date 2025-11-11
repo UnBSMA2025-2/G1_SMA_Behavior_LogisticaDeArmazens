@@ -25,11 +25,7 @@ public class WinnerDeterminationService {
         this.bestCombination = new ArrayList<>();
         this.maxUtility = 0.0;
         this.productDemand = productDemand;
-
-        // Pré-processamento: Ordenar os lances por utilidade decrescente.
         results.sort(Comparator.comparingDouble(NegotiationResult::getUtility).reversed());
-
-        // Inicia a busca recursiva a partir do primeiro lance (índice 0)
         branchAndBoundRecursive(results, 0, new ArrayList<>(), 0.0, new HashSet<>());
 
         return this.bestCombination;
@@ -46,23 +42,14 @@ public class WinnerDeterminationService {
     private void branchAndBoundRecursive(List<NegotiationResult> allResults, int index,
                                          List<NegotiationResult> currentCombination, double currentUtility,
                                          Set<String> usedSuppliers) {
-
-        // --- PODA (PRUNING) ---
-        // Calcula o limite superior (upper bound) para este caminho.
         double potentialUtility = currentUtility;
         for (int i = index; i < allResults.size(); i++) {
             potentialUtility += allResults.get(i).getUtility();
         }
-        
-        // Se o melhor resultado possível deste caminho não supera a melhor solução já encontrada, pode.
         if (potentialUtility <= maxUtility) {
             return;
         }
-
-        // --- CASO BASE (FOLHA DA ÁRVORE) ---
-        // Se já consideramos todos os lances.
         if (index == allResults.size()) {
-            // Verifica se a solução atual é completa (satisfaz a demanda) e melhor que a global.
             if (satisfiesDemand(currentCombination) && currentUtility > maxUtility) {
                 this.maxUtility = currentUtility;
                 this.bestCombination = new ArrayList<>(currentCombination);
@@ -70,28 +57,15 @@ public class WinnerDeterminationService {
             return;
         }
 
-        // --- RAMIFICAÇÃO (BRANCHING) ---
-
         NegotiationResult currentResult = allResults.get(index);
-
-        // RAMO 1: INCLUIR o lance atual (se as restrições permitirem).
-        // Restrição: O fornecedor não pode ter sido usado ainda.
         if (!usedSuppliers.contains(currentResult.getSupplierName())) {
-            // Cria um novo estado para o ramo de inclusão
             currentCombination.add(currentResult);
             usedSuppliers.add(currentResult.getSupplierName());
-
-            // Chamada recursiva para o próximo nível da árvore
             branchAndBoundRecursive(allResults, index + 1, currentCombination,
                                     currentUtility + currentResult.getUtility(), usedSuppliers);
-
-            // Backtracking: desfaz as alterações para explorar outros caminhos
             usedSuppliers.remove(currentResult.getSupplierName());
             currentCombination.remove(currentCombination.size() - 1);
         }
-
-        // RAMO 2: EXCLUIR o lance atual.
-        // Simplesmente passa para o próximo lance sem adicionar o atual.
         branchAndBoundRecursive(allResults, index + 1, currentCombination, currentUtility, usedSuppliers);
     }
 

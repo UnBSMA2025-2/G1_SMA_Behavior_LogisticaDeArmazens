@@ -3,6 +3,7 @@ package mas.agents;
 import jade.core.AID;
 import jade.core.Agent;
 import jade.core.behaviours.CyclicBehaviour;
+import jade.core.behaviours.OneShotBehaviour;
 import jade.core.behaviours.TickerBehaviour;
 import jade.lang.acl.ACLMessage;
 import jade.lang.acl.MessageTemplate;
@@ -26,6 +27,18 @@ public class TaskDecomposerAgent extends Agent {
 
     protected void setup() {
         logger.info("Dynamic TDA {} setup started.", getAID().getName());
+        addBehaviour(new OneShotBehaviour() {
+            @Override
+            public void action() {
+                try {
+                    Thread.sleep(2000); // Pequeno delay para garantir que outros agentes estejam prontos
+                    sendCurrentDemand();
+                    logger.info("TDA: Initial demand sent on startup");
+                } catch (InterruptedException e) {
+                    logger.error("TDA: Error in initial demand", e);
+                }
+            }
+        });
 
         addBehaviour(new TickerBehaviour(this, 10000) {
             protected void onTick() {

@@ -26,6 +26,7 @@ public class HttpBridgeAgent extends Agent {
             server = HttpServer.create(new InetSocketAddress(port), 0);
             server.createContext("/api/config", new ConfigHandler());
             server.createContext("/api/status", new StatusHandler());
+            server.createContext("/api/start-negotiation", new StartNegotiationHandler());
             server.setExecutor(null);
             server.start();
             System.out.println("[HttpBridgeAgent] HTTP server started on http://localhost:" + port);
@@ -131,6 +132,48 @@ public class HttpBridgeAgent extends Agent {
             try (OutputStream os = exchange.getResponseBody()) { os.write(resp.getBytes(StandardCharsets.UTF_8)); }
         }
     }
+
+    private class StartNegotiationHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+                addCors(exchange);
+                exchange.sendResponseHeaders(204, -1);
+                return;
+            }
+
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                addCors(exchange);
+                exchange.sendResponseHeaders(405, -1);
+                return;
+            }
+
+            addCors(exchange);
+
+            try {
+                ACLMessage msg = new ACLMessage(ACLMessage.REQUEST);
+                msg.addReceiver(new AID("tda", AID.ISLOCALNAME));
+                msg.setContent("URGENT_DEMAND_CHANGE");
+                send(msg);
+                System.out.println("[HttpBridgeAgent] Sent immediate negotiation request to TDA");
+
+                String resp = "{\"status\": \"Negotiation started\"}";
+                exchange.sendResponseHeaders(200, resp.getBytes(StandardCharsets.UTF_8).length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(resp.getBytes(StandardCharsets.UTF_8));
+                }
+
+            } catch (Exception ex) {
+                ex.printStackTrace();
+                String resp = "{\"error\": \"" + ex.getMessage() + "\"}";
+                exchange.sendResponseHeaders(500, resp.getBytes(StandardCharsets.UTF_8).length);
+                try (OutputStream os = exchange.getResponseBody()) { 
+                    os.write(resp.getBytes(StandardCharsets.UTF_8)); 
+                }
+            }
+        }
+    }
+
 
     private String readRequestBody(HttpExchange exchange) throws IOException {
         try (InputStream in = exchange.getRequestBody(); ByteArrayOutputStream baos = new ByteArrayOutputStream()) {

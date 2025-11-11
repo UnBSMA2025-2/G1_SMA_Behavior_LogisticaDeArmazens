@@ -41,7 +41,6 @@ import java.util.Map;
 public class SellerAgent extends Agent {
     private static final Logger logger = LoggerFactory.getLogger(SellerAgent.class);
 
-    // Nomes dos estados
     private static final String STATE_WAIT_FOR_REQUEST = "WaitForRequest";
     private static final String STATE_SEND_INITIAL_PROPOSAL = "SendInitialProposal";
     private static final String STATE_WAIT_FOR_RESPONSE = "WaitForResponse";
@@ -50,17 +49,16 @@ public class SellerAgent extends Agent {
     private static final String STATE_MAKE_NEW_PROPOSAL = "MakeNewProposal";
     private static final String STATE_END_NEGOTIATION = "EndNegotiation";
 
-    // Variáveis de estado
     private AID buyerAgent;
     private ACLMessage receivedCounterMsg;
     private int currentRound = 0;
     private String negotiationId;
     private ACLMessage initialRequestMsg;
-    // Serviços e Configurações
+    
     private EvaluationService evalService;
     private ConcessionService concessionService;
     private Map<String, Double> sellerWeights;
-    private Map<String, IssueParameters> sellerIssueParams; // TODO: Deve ser um Map<String, Map<String, IssueParameters>>
+    private Map<String, IssueParameters> sellerIssueParams;
     private double sellerAcceptanceThreshold;
     private double sellerRiskBeta;
     private double sellerGamma;
@@ -70,16 +68,30 @@ public class SellerAgent extends Agent {
     protected void setup() {
         logger.info("Seller Agent {} is ready.", getAID().getName());
         setupSellerPreferences();
+        startNegotiationFSM();
+    }
 
+    /**
+     * Cria e adiciona uma nova FSM para negociação.
+     * Este método é chamado no setup e também após cada negociação terminar,
+     * permitindo que o SellerAgent atenda múltiplas negociações.
+     */
+    private void startNegotiationFSM() {
+        buyerAgent = null;
+        receivedCounterMsg = null;
+        currentRound = 0;
+        negotiationId = null;
+        initialRequestMsg = null;
+        
         FSMBehaviour fsm = new FSMBehaviour(this) {
             @Override
             public int onEnd() {
                 logger.info("{}: FSM finished.", myAgent.getLocalName());
+                startNegotiationFSM();
                 return super.onEnd();
             }
         };
 
-        // REGISTRA ESTADOS
         fsm.registerFirstState(new WaitForRequest(), STATE_WAIT_FOR_REQUEST);
         fsm.registerState(new SendInitialProposal(), STATE_SEND_INITIAL_PROPOSAL);
         fsm.registerState(new WaitForResponse(this), STATE_WAIT_FOR_RESPONSE);
@@ -88,7 +100,6 @@ public class SellerAgent extends Agent {
         fsm.registerState(new MakeNewProposal(), STATE_MAKE_NEW_PROPOSAL);
         fsm.registerLastState(new EndNegotiation(), STATE_END_NEGOTIATION);
 
-        // REGISTRA TRANSIÇÕES
         fsm.registerDefaultTransition(STATE_WAIT_FOR_REQUEST, STATE_SEND_INITIAL_PROPOSAL);
         fsm.registerDefaultTransition(STATE_SEND_INITIAL_PROPOSAL, STATE_WAIT_FOR_RESPONSE);
         fsm.registerTransition(STATE_WAIT_FOR_RESPONSE, STATE_EVALUATE_COUNTER, 1); // Counter recebido
@@ -101,7 +112,6 @@ public class SellerAgent extends Agent {
 
         addBehaviour(fsm);
     }
-
     private void setupSellerPreferences() {
         ConfigLoader config = ConfigLoader.getInstance();
         this.evalService = new EvaluationService();
@@ -115,16 +125,12 @@ public class SellerAgent extends Agent {
 
         sellerWeights = new HashMap<>();
         sellerWeights.put("price", config.getDouble("seller.weights.price"));
-        sellerWeights.put("quality", config.getDouble("seller.weights.quality")); // Adicionado
-        sellerWeights.put("delivery", config.getDouble("seller.weights.delivery")); // Adicionado
+        sellerWeights.put("quality", config.getDouble("seller.weights.quality"));
+        sellerWeights.put("delivery", config.getDouble("seller.weights.delivery"));
         sellerWeights.put("service", config.getDouble("seller.weights.service"));
 
 
         sellerIssueParams = new HashMap<>();
-        // TODO (SINERGIA): Mesma falha do BuyerAgent.
-        // O Vendedor também deve ter diferentes [min, max] (seus custos/limites)
-        // para diferentes pacotes de produtos.
-        // Esta estrutura de dados é inadequada.
         loadIssueParams(config, "price", IssueType.COST, "seller.params.");
         loadIssueParams(config, "delivery", IssueType.COST, "seller.params.");
         sellerIssueParams.put("quality", new IssueParameters(0, 1, IssueType.QUALITATIVE));
@@ -151,8 +157,6 @@ public class SellerAgent extends Agent {
         }
     }
 
-
-    // --- Comportamentos da FSM ---
 
     /**
      * Estado 1: Aguarda o "Call for Proposal" (CFP) do BuyerAgent.
@@ -201,9 +205,6 @@ public class SellerAgent extends Agent {
             issues.add(new NegotiationIssue("Quality", initialQuality));
             issues.add(new NegotiationIssue("Delivery", initialDelivery));
             issues.add(new NegotiationIssue("Service", initialService));
-
-            // A lógica abaixo simula diferentes fornecedores oferecendo diferentes pacotes.
-            // Esta é uma SIMULAÇÃO CORRETA para testar o WinnerDetermination.
             ProductBundle pb;
             int[] quantities;
             String myName = myAgent.getLocalName();
@@ -223,15 +224,6 @@ public class SellerAgent extends Agent {
             }
             Bid initialBid = new Bid(pb, issues, quantities);
 
-            // TODO (Simplificação de Arquitetura): Envia UMA Proposal com UM Bid.
-            // O artigo exige que o SA envie uma Proposal com MÚLTIPLOS Bids
-            // (ex: um para P1, um para P2, um para P1+P2), permitindo ao
-            // comprador escolher o pacote.
-            // A lógica aqui deveria ser:
-            // 1. Obter a lista de pacotes permitidos (do SDA, via BA/CA).
-            // 2. Gerar um Bid inicial para CADA pacote que ele pode fornecer.
-            // 3. Adicionar TODOS esses Bids a 'List<Bid> allBids'.
-            // 4. new Proposal(allBids);
             Proposal proposal = new Proposal(List.of(initialBid));
 
             ACLMessage msg = new ACLMessage(ACLMessage.PROPOSE);
@@ -241,6 +233,10 @@ public class SellerAgent extends Agent {
             msg.setReplyWith("prop-" + negotiationId + "-" + System.currentTimeMillis());
             try {
                 msg.setContentObject(proposal);
+                String readableContent = String.format("INITIAL PROPOSAL - Bundle: %s, Price: %.2f", 
+                    initialBid.getProductBundle().getProducts(), 
+                    initialPrice);
+                msg.addUserDefinedParameter("readable-content", readableContent);
                 myAgent.send(msg);
                 logger.info("{}: Sent initial proposal -> Price: {}", myAgent.getLocalName(), initialPrice);
             } catch (IOException e) {
@@ -284,9 +280,10 @@ public class SellerAgent extends Agent {
 
             if (msg != null) {
                 if (msg.getPerformative() == ACLMessage.ACCEPT_PROPOSAL) {
-                    logger.info("{}: Buyer accepted my last offer!", myAgent.getLocalName());
+                    logger.info("{} [R{}]: Buyer ACCEPTED my last offer!", myAgent.getLocalName(), currentRound);
                     nextTransition = 0; // Vai para EndNegotiation
                 } else { // É PROPOSE (contraproposta)
+                    logger.info("{} [R{}]: Received COUNTER-PROPOSAL from buyer.", myAgent.getLocalName(), currentRound);
                     receivedCounterMsg = msg;
                     nextTransition = 1; // Vai para EvaluateCounterProposal
                 }
@@ -317,9 +314,13 @@ public class SellerAgent extends Agent {
 
     /**
      * Estado 4: Avalia a contraproposta recebida do Comprador.
+     * 
+     * IMPROVED: Now processes ALL bids in the counter-proposal.
      */
     private class EvaluateCounterProposal extends OneShotBehaviour {
         private int transitionEvent = 2; // Default: falha/deadline
+        private List<Bid> acceptedBids = new ArrayList<>();
+        private List<Bid> rejectedBids = new ArrayList<>();
 
         @Override
         public void action() {
@@ -337,28 +338,38 @@ public class SellerAgent extends Agent {
                 if (content instanceof Proposal) {
                     Proposal p = (Proposal) content;
                     if (p.getBids() != null && !p.getBids().isEmpty()) {
+                        for (Bid counterBid : p.getBids()) {
+                            double utilityForSeller = evalService.calculateUtility("seller", counterBid, sellerWeights, sellerIssueParams, sellerRiskBeta);
+                            logger.debug("{}: Bid {} counter utility = {} (Threshold = {})",
+                                    myAgent.getLocalName(),
+                                    counterBid.getProductBundle().getProducts(),
+                                    String.format("%.4f", utilityForSeller),
+                                    String.format("%.4f", sellerAcceptanceThreshold));
 
-                        // TODO (Simplificação de Arquitetura): Falha idêntica ao BuyerAgent.
-                        // Pega apenas o lance [0]. Deveria ser um LOOP "bid-by-bid".
-                        Bid counterBid = p.getBids().get(0);
-
-                        // TODO (SINERGIA): 'sellerIssueParams' genérico.
-                        // Deveria usar params específicos para o 'counterBid.getProductBundle()'.
-                        double utilityForSeller = evalService.calculateUtility("seller", counterBid, sellerWeights, sellerIssueParams, sellerRiskBeta);
-                        logger.info("{}: Received counter utility = {} (Threshold = {})",
-                                myAgent.getLocalName(),
-                                String.format("%.4f", utilityForSeller),
-                                String.format("%.4f", sellerAcceptanceThreshold));
-
-                        // TODO (Simplificação): Esta lógica é "tudo ou nada".
-                        // O agente aceita ou rejeita a proposta inteira (de 1 item).
-                        // Na implementação correta, ele decidiria por lance.
-                        if (utilityForSeller >= sellerAcceptanceThreshold) {
-                            logger.info("{}: Counter-offer is acceptable. Accepting.", myAgent.getLocalName());
-                            transitionEvent = 1; // Aceitar
+                            if (utilityForSeller >= sellerAcceptanceThreshold) {
+                                logger.info("{}: Bid {} ACCEPTABLE (utility {} >= threshold {})",
+                                    myAgent.getLocalName(),
+                                    counterBid.getProductBundle().getProducts(),
+                                    String.format("%.4f", utilityForSeller),
+                                    String.format("%.4f", sellerAcceptanceThreshold));
+                                acceptedBids.add(counterBid);
+                            } else {
+                                logger.debug("{}: Bid {} REJECTED (utility {} < threshold {})",
+                                    myAgent.getLocalName(),
+                                    counterBid.getProductBundle().getProducts(),
+                                    String.format("%.4f", utilityForSeller),
+                                    String.format("%.4f", sellerAcceptanceThreshold));
+                                rejectedBids.add(counterBid);
+                            }
+                        }
+                        if (!acceptedBids.isEmpty()) {
+                            logger.info("{}: Accepting {} out of {} bids", 
+                                myAgent.getLocalName(), acceptedBids.size(), p.getBids().size());
+                            transitionEvent = 1; // Accept
                         } else {
-                            logger.info("{}: Counter-offer not acceptable. Will make new proposal for round {}", myAgent.getLocalName(), (currentRound + 1));
-                            transitionEvent = 0; // Rejeitar
+                            logger.info("{}: All {} bids rejected. Will make new proposal for round {}", 
+                                myAgent.getLocalName(), rejectedBids.size(), (currentRound + 1));
+                            transitionEvent = 0; // Reject/Counter
                         }
                     } else {
                         transitionEvent = 2;
@@ -384,20 +395,35 @@ public class SellerAgent extends Agent {
     private class AcceptCounterOffer extends OneShotBehaviour {
         @Override
         public void action() {
-            // TODO (Simplificação): Aceita a proposta/lance [0].
-            // Na implementação correta, deveria aceitar lances específicos.
             logger.info("{}: Sending acceptance for buyer's counter-offer.", myAgent.getLocalName());
             ACLMessage acceptMsg = new ACLMessage(ACLMessage.ACCEPT_PROPOSAL);
             acceptMsg.addReceiver(buyerAgent);
             acceptMsg.setConversationId(negotiationId);
             acceptMsg.setInReplyTo(receivedCounterMsg.getReplyWith());
-            acceptMsg.setContent("Accepted your counter-offer.");
+            try {
+                Proposal receivedP = (Proposal) receivedCounterMsg.getContentObject();
+                if (!receivedP.getBids().isEmpty()) {
+                    Bid acceptedBid = receivedP.getBids().get(0);
+                    Object priceValue = acceptedBid.getIssues().get(0).getValue();
+                    String content = String.format("ACCEPTED - Bundle: %s, Final Price: %s", 
+                        acceptedBid.getProductBundle().getProducts(), 
+                        priceValue);
+                    acceptMsg.setContent(content);
+                } else {
+                    acceptMsg.setContent("Accepted your counter-offer.");
+                }
+            } catch (Exception e) {
+                acceptMsg.setContent("Accepted your counter-offer.");
+            }
+            
             myAgent.send(acceptMsg);
         }
     }
 
     /**
      * Estado 6: Gera e envia uma nova proposta (rejeitando a contraproposta).
+     * 
+     * IMPROVED: Now generates new proposals for ALL bids in the counter-proposal.
      */
     private class MakeNewProposal extends OneShotBehaviour {
         @Override
@@ -406,25 +432,25 @@ public class SellerAgent extends Agent {
 
             try {
                 Proposal receivedP = (Proposal) receivedCounterMsg.getContentObject();
-                // TODO (Simplificação): Pega apenas o lance [0] como referência.
-                // Deveria ser um LOOP, gerando novas propostas para
-                // todos os lances que o comprador contra-ofertou.
-                Bid receivedB = receivedP.getBids().get(0);
+                List<Bid> newSellerBids = new ArrayList<>();
+                for (Bid receivedB : receivedP.getBids()) {
+                    Bid newSellerBid = concessionService.generateCounterBid(
+                            receivedB,
+                            currentRound,
+                            maxRounds,
+                            sellerGamma,
+                            discountRate,
+                            sellerIssueParams,
+                            "seller"
+                    );
+                    newSellerBids.add(newSellerBid);
+                    logger.debug("{}: Generated new proposal for bundle {} -> Price: {}", 
+                        myAgent.getLocalName(),
+                        newSellerBid.getProductBundle().getProducts(),
+                        newSellerBid.getIssues().get(0).getValue());
+                }
 
-                // TODO (SINERGIA): 'sellerIssueParams' genérico.
-                Bid newSellerBid = concessionService.generateCounterBid(
-                        receivedB,
-                        currentRound,
-                        maxRounds,
-                        sellerGamma,
-                        discountRate,
-                        sellerIssueParams,
-                        "seller"
-                );
-
-                // TODO (Simplificação): Envia uma lista de 1 lance.
-                // Deveria ser uma lista de todos os lances recém-gerados.
-                Proposal newProposal = new Proposal(List.of(newSellerBid));
+                Proposal newProposal = new Proposal(newSellerBids);
                 ACLMessage proposeMsg = new ACLMessage(ACLMessage.PROPOSE);
                 proposeMsg.addReceiver(buyerAgent);
                 proposeMsg.setConversationId(negotiationId);
@@ -432,7 +458,8 @@ public class SellerAgent extends Agent {
                 proposeMsg.setReplyWith("prop-" + negotiationId + "-" + System.currentTimeMillis());
                 proposeMsg.setContentObject(newProposal);
                 myAgent.send(proposeMsg);
-                logger.info("{}: Sent new proposal (Round {}) -> {}", myAgent.getLocalName(), currentRound, newSellerBid.getIssues().get(0));
+                logger.info("{}: Sent new proposal (Round {}) with {} bids", 
+                    myAgent.getLocalName(), currentRound, newSellerBids.size());
 
             } catch (UnreadableException | IOException e) {
                 logger.error("{}: Error creating/sending new proposal", myAgent.getLocalName(), e);

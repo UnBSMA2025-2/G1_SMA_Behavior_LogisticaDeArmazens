@@ -19,8 +19,6 @@ public class SynergyDeterminationAgent extends Agent {
 
     protected void setup() {
         logger.info("SDA {} is ready.", getAID().getName());
-
-        // Comportamento para aguardar e responder a pedidos de pacotes de produtos
         addBehaviour(new CyclicBehaviour() {
             public void action() {
                 MessageTemplate mt = MessageTemplate.and(
@@ -31,9 +29,6 @@ public class SynergyDeterminationAgent extends Agent {
 
                 if (msg != null) {
                     logger.info("SDA: Received request for product bundles from {}", msg.getSender().getName());
-
-                    // Simula o algoritmo de determinação de pacotes.
-                    // Baseado no Experimento 1, Passo 3.
                     List<ProductBundle> preferredBundles = generatePreferredBundles();
 
                     ACLMessage reply = msg.createReply();
@@ -55,12 +50,10 @@ public class SynergyDeterminationAgent extends Agent {
 
     private List<ProductBundle> generatePreferredBundles() {
         List<ProductBundle> bundles = new ArrayList<>();
-        // Pacotes de um único produto
         bundles.add(new ProductBundle(new int[]{1, 0, 0, 0})); // P1
         bundles.add(new ProductBundle(new int[]{0, 1, 0, 0})); // P2
         bundles.add(new ProductBundle(new int[]{0, 0, 1, 0})); // P3
         bundles.add(new ProductBundle(new int[]{0, 0, 0, 1})); // P4
-        // Pacotes de dois produtos (sinergia)
         bundles.add(new ProductBundle(new int[]{1, 1, 0, 0})); // P1P2
         bundles.add(new ProductBundle(new int[]{1, 0, 1, 0})); // P1P3
         bundles.add(new ProductBundle(new int[]{1, 0, 0, 1})); // P1P4

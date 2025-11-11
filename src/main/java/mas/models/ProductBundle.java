@@ -9,7 +9,6 @@ import java.util.Arrays;
  * que o produto está no pacote, e 0 caso contrário. 
  */
 public class ProductBundle implements Serializable {
-    // Garante a compatibilidade entre diferentes versões da classe durante a serialização.
     private static final long serialVersionUID = 1L;
 
     private final int[] products;
